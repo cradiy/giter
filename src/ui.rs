@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
 use crate::{
@@ -32,10 +32,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
     let rows = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Min(4),
-        Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(1),
     ])
     .split(area);
@@ -85,7 +84,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Style::default().fg(PURPLE),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(header)), rows[0]);
+    let message = format!(
+        "{}{}",
+        if app.busy { "Working…  " } else { "" },
+        safe(&app.message)
+    );
+    let message = Line::raw(message);
+    let status_width = if message.width() == 0 {
+        0
+    } else {
+        (message
+            .width()
+            .saturating_add(2)
+            .min(usize::from(area.width / 2))) as u16
+    };
+    let status =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(status_width)]).split(rows[2]);
+    frame.render_widget(Paragraph::new(Line::from(header)), status[0]);
+    frame.render_widget(
+        Paragraph::new(message)
+            .right_aligned()
+            .style(Style::default().fg(if app.error { RED } else { MUTED })),
+        status[1],
+    );
     let counts = snapshot
         .map(|s| {
             [
@@ -141,13 +162,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(tabs)), rows[1]);
+    frame.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
     if app.tab == Tab::Files {
-        draw_files(frame, rows[2], app);
+        draw_files(frame, rows[1], app);
     } else {
         let sidebar = (area.width / 3).clamp(23, 42);
         let columns =
-            Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(20)]).split(rows[2]);
+            Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(20)]).split(rows[1]);
         app.page_height = if app.list_focus {
             columns[0].height.saturating_sub(2) as usize
         } else {
@@ -156,16 +177,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         render_list(frame, columns[0], app);
         render_preview(frame, columns[1], app);
     }
-    frame.render_widget(
-        Paragraph::new(format!(
-            " {}{}",
-            if app.busy { "Working…  " } else { "" },
-            safe(&app.message)
-        ))
-        .style(Style::default().fg(if app.error { RED } else { MUTED }))
-        .wrap(Wrap { trim: false }),
-        rows[3],
-    );
     let hints = if app.tab == Tab::Files {
         if app.file_tree_focus {
             let mut hints = vec![
@@ -270,7 +281,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     frame.render_widget(
         Paragraph::new(hints).style(Style::default().bg(PANEL).fg(MUTED)),
-        rows[4],
+        rows[3],
     );
     match &app.mode {
         Mode::Help => render_help(frame),

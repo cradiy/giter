@@ -958,10 +958,7 @@ impl App {
                                 self.mode = Mode::Normal;
                                 self.committing = false;
                             }
-                            self.notice(
-                                message.unwrap_or_else(|| "Repository refreshed".into()),
-                                false,
-                            );
+                            self.notice(message.unwrap_or_default(), false);
                             self.load_preview();
                         }
                         Err(error) => {
