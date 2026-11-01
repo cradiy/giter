@@ -14,6 +14,8 @@ Use `1` for working-tree changes, `2` for staged changes, and `3` for the latest
 
 Select a file to inspect its diff. Select a directory, including the root, to see its change summary. `s` / `u` stage / unstage all files listed under that directory, including collapsed descendants. With an active search, the scope includes only matching files; matching ancestors expand automatically. Directory staging checks all selected conflicts before updating the index. Git reads and writes run on a worker thread. Press `r` to refresh after external changes.
 
+In History, selecting a commit shows its metadata. Press Enter or `l` to browse that commit's changed files in the same collapsible tree. Select a file to see only its patch, with the same status colors and navigation. `/` filters historical paths. Esc or Backspace returns to the commit list and restores its selection and search. Historical views are read-only and use committed content, independent of the current index and working tree. Merge commits compare against their first parent; root commits compare against the empty tree.
+
 | Key | Action |
 | --- | --- |
 | `j/k`, arrows | Move through files or scroll the preview |
@@ -21,6 +23,8 @@ Select a file to inspect its diff. Select a directory, including the root, to se
 | Enter / Space | Toggle selected directory; Enter on a file opens preview |
 | `Tab` | Switch focus between tree and preview |
 | `Ctrl+h/l` | Previous / next tab, wrapping around |
+| Enter / `l` on a commit | Open its changed-file tree |
+| Esc / Backspace in commit files | Return to the commit list |
 | `gg`, `G` | First / last item or line |
 | `Ctrl+d/u`, Page Down/Up | Scroll half / full page |
 | `H/L` | Scroll content horizontally |

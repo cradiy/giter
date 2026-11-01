@@ -43,7 +43,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let branch = snapshot.map_or("…", |s| s.branch.as_str());
     let operation = snapshot.map_or("", |s| s.operation.as_str());
     let conflicts = snapshot.map_or(0, |s| s.files.iter().filter(|f| f.conflicted()).count());
-    let header = Line::from(vec![
+    let mut header = vec![
         Span::styled(
             " giter ",
             Style::default()
@@ -57,8 +57,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             format!("  {}", safe(&app.repo.root.display().to_string())),
             Style::default().fg(MUTED),
         ),
-    ]);
-    frame.render_widget(Paragraph::new(header), rows[0]);
+    ];
+    if let Some(history) = &app.history {
+        header.push(Span::styled(
+            format!(
+                "  History / {} · {}",
+                &history.commit.id[..8],
+                safe(&history.commit.subject)
+            ),
+            Style::default().fg(PURPLE),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(header)), rows[0]);
     let counts = snapshot
         .map(|s| {
             [
@@ -125,7 +135,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: false }),
         rows[3],
     );
-    let hints = if app.preview.as_ref().is_some_and(|p| p.conflict.is_some()) {
+    let hints = if app.commit_list() {
+        vec![
+            ("j/k", "commits", BLUE),
+            ("Enter/l", "files", PURPLE),
+            ("/", "search", CYAN),
+            ("Ctrl+h/l", "tabs", PEACH),
+            ("?", "help", AMBER),
+            ("q", "quit", RED),
+        ]
+    } else if app.history.is_some() {
+        vec![
+            ("hjkl", "tree", BLUE),
+            ("Enter", "preview", GREEN),
+            ("Esc", "commits", PURPLE),
+            ("/", "search", CYAN),
+            ("Ctrl+h/l", "tabs", PEACH),
+            ("?", "help", AMBER),
+        ]
+    } else if app.preview.as_ref().is_some_and(|p| p.conflict.is_some()) {
         vec![
             ("hjkl", "move", BLUE),
             ("[ ]", "conflict", AMBER),
@@ -204,7 +232,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let indices = app.items();
     let mut items = Vec::new();
     if let Some(snapshot) = &app.snapshot {
-        if app.tab == Tab::Log {
+        if app.commit_list() {
             for &index in &indices {
                 let commit = &snapshot.commits[index];
                 items.push(ListItem::new(vec![
@@ -225,6 +253,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
                 ]));
             }
         } else {
+            let files = app.files();
             for row in app.tree_rows() {
                 let mut spans = vec![Span::styled(
                     row.prefix.clone(),
@@ -253,9 +282,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
                         let count = row
                             .files
                             .iter()
-                            .filter(|index| {
-                                snapshot.files[**index].status(app.tab == Tab::Staged) == status
-                            })
+                            .filter(|index| files[**index].status(app.staged_status()) == status)
                             .count();
                         if count > 0 {
                             spans.push(Span::styled(
@@ -265,8 +292,8 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
                         }
                     }
                 } else {
-                    let file = &snapshot.files[row.files[0]];
-                    let status = file.status(app.tab == Tab::Staged);
+                    let file = &files[row.files[0]];
+                    let status = file.status(app.staged_status());
                     let color = change_color(status);
                     spans.push(Span::styled(
                         format!("{} ", change_symbol(status)),
@@ -282,7 +309,13 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
     let title = if app.filter.is_empty() {
-        format!(" Files · {} ", indices.len())
+        if app.commit_list() {
+            format!(" Commits · {} ", indices.len())
+        } else if let Some(history) = &app.history {
+            format!(" Files · {} · {} ", indices.len(), &history.commit.id[..8])
+        } else {
+            format!(" Files · {} ", indices.len())
+        }
     } else {
         format!(" / {} · {} ", safe(&app.filter), indices.len())
     };
@@ -309,8 +342,14 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(
             Paragraph::new(if !app.filter.is_empty() {
                 "No matches"
-            } else if app.tab == Tab::Log {
+            } else if app.commit_list() {
                 "No commits yet"
+            } else if let Some(history) = &app.history {
+                if history.details.is_none() {
+                    "Loading commit files…"
+                } else {
+                    "No files changed"
+                }
             } else {
                 "Nothing here"
             })
@@ -471,7 +510,7 @@ fn render_input(frame: &mut Frame, input: &Input, title: &'static str, multiline
 }
 
 fn render_help(frame: &mut Frame) {
-    let area = popup(frame.area(), 84, 30);
+    let area = popup(frame.area(), 84, 34);
     frame.render_widget(Clear, area);
     let text = vec![
         Line::styled(
@@ -489,6 +528,9 @@ fn render_help(frame: &mut Frame) {
         Line::raw(" 1 / 2 / 3       Changes / staged / recent history"),
         Line::raw(" /               Search current list (Unicode input)"),
         Line::raw(" r               Refresh repository and preview"),
+        Line::raw(" Enter / l       Open selected commit's file tree"),
+        Line::raw(" Esc / Backspace Return from commit files to the log"),
+        Line::raw(" History files are read-only; merge diff uses first parent."),
         Line::raw(""),
         Line::styled(
             " GIT",

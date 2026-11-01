@@ -133,13 +133,32 @@ fn gutter(index: usize, width: usize, color: Color) -> Span<'static> {
 }
 
 fn patch(text: &str) -> Vec<Line<'static>> {
-    let width = text.lines().count().max(1).to_string().len().max(3);
-    text.lines()
+    let mut in_diff = false;
+    let mut in_hunk = false;
+    let lines: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            if line.starts_with("diff --git ") {
+                in_diff = true;
+                in_hunk = false;
+                return false;
+            }
+            if in_diff && line.starts_with("@@") {
+                in_hunk = true;
+            }
+            !(in_diff
+                && !in_hunk
+                && ["index ", "--- ", "+++ "]
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix)))
+        })
+        .collect();
+    let width = lines.len().max(1).to_string().len().max(3);
+    lines
+        .into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let (fg, bg) = if line.starts_with("+++") || line.starts_with("---") {
-                (BLUE, BG)
-            } else if line.starts_with('+') {
+            let (fg, bg) = if line.starts_with('+') {
                 (GREEN, ADD_BG)
             } else if line.starts_with('-') {
                 (RED, DELETE_BG)
@@ -253,5 +272,35 @@ pub fn preview(preview: &Preview) -> StyledPreview {
             sources: None,
             chunks: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hides_file_headers_but_keeps_header_like_source_lines_and_binary_summaries() {
+        let text = "diff --git a/code b/code\nindex 123..456 100644\n--- a/code\n+++ b/code\n@@ -1 +1 @@\n--- a/source text\n+++ b/source text\ndiff --git a/image b/image\nindex abc..def 100644\nBinary files a/image and b/image differ\n";
+        let lines = patch(text);
+        let visible: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .skip(1)
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                "@@ -1 +1 @@",
+                "--- a/source text",
+                "+++ b/source text",
+                "Binary files a/image and b/image differ"
+            ]
+        );
     }
 }

@@ -8,7 +8,9 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
 use crate::{
-    git::{self, Preview, Repo, Request, Response, Selection, Snapshot},
+    git::{
+        self, Commit, CommitDetails, File, Preview, Repo, Request, Response, Selection, Snapshot,
+    },
     input::Input,
 };
 
@@ -32,6 +34,15 @@ pub enum Action {
     Editor(PathBuf),
 }
 
+pub struct History {
+    pub commit: Commit,
+    pub details: Option<CommitDetails>,
+    token: u64,
+    return_selected: usize,
+    return_filter: String,
+    return_list_state: ListState,
+}
+
 pub struct App {
     pub repo: Repo,
     pub snapshot: Option<Snapshot>,
@@ -52,7 +63,9 @@ pub struct App {
     pub error: bool,
     pub busy: bool,
     pub page_height: usize,
-    collapsed: [HashSet<PathBuf>; 2],
+    pub history: Option<History>,
+    collapsed: [HashSet<PathBuf>; 3],
+    history_generation: u64,
     sender: Sender<Request>,
     receiver: Receiver<Response>,
     generation: u64,
@@ -83,7 +96,9 @@ impl App {
             error: false,
             busy: true,
             page_height: 10,
-            collapsed: [HashSet::new(), HashSet::new()],
+            history: None,
+            collapsed: [HashSet::new(), HashSet::new(), HashSet::new()],
+            history_generation: 0,
             sender,
             receiver,
             generation: 0,
@@ -94,42 +109,75 @@ impl App {
         app
     }
 
-    pub fn items(&self) -> Vec<usize> {
-        let Some(snapshot) = &self.snapshot else {
-            return Vec::new();
-        };
-        let query = self.filter.to_lowercase();
+    pub fn commit_list(&self) -> bool {
+        self.tab == Tab::Log && self.history.is_none()
+    }
+
+    pub fn files(&self) -> &[File] {
+        if let Some(history) = &self.history {
+            history
+                .details
+                .as_ref()
+                .map_or(&[], |details| details.files.as_slice())
+        } else {
+            self.snapshot
+                .as_ref()
+                .map_or(&[], |snapshot| snapshot.files.as_slice())
+        }
+    }
+
+    pub fn staged_status(&self) -> bool {
+        self.tab != Tab::Changes
+    }
+
+    fn tree_index(&self) -> usize {
         match self.tab {
-            Tab::Log => snapshot
-                .commits
+            Tab::Changes => 0,
+            Tab::Staged => 1,
+            Tab::Log => 2,
+        }
+    }
+
+    pub fn items(&self) -> Vec<usize> {
+        let query = self.filter.to_lowercase();
+        if self.commit_list() {
+            self.snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .commits
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            format!("{} {} {}", c.id, c.subject, c.author)
+                                .to_lowercase()
+                                .contains(&query)
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.files()
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| {
-                    format!("{} {} {}", c.id, c.subject, c.author)
-                        .to_lowercase()
-                        .contains(&query)
+                .filter(|(_, file)| {
+                    (self.history.is_some()
+                        || if self.tab == Tab::Changes {
+                            file.unstaged()
+                        } else {
+                            file.staged()
+                        })
+                        && file.label().to_lowercase().contains(&query)
                 })
                 .map(|(i, _)| i)
-                .collect(),
-            tab => snapshot
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| {
-                    (if tab == Tab::Changes {
-                        f.unstaged()
-                    } else {
-                        f.staged()
-                    }) && f.label().to_lowercase().contains(&query)
-                })
-                .map(|(i, _)| i)
-                .collect(),
+                .collect()
         }
     }
 
     pub fn selection(&self) -> Option<Selection> {
-        let snapshot = self.snapshot.as_ref()?;
-        if self.tab == Tab::Log {
+        if self.commit_list() {
+            let snapshot = self.snapshot.as_ref()?;
             return self
                 .items()
                 .get(self.selected)
@@ -137,41 +185,50 @@ impl App {
         }
         let rows = self.tree_rows();
         let row = rows.get(self.selected)?;
+        let files = self.files();
+        if let Some(history) = &self.history {
+            let details = history.details.as_ref()?;
+            return Some(if row.directory {
+                Selection::CommitDirectory {
+                    id: history.commit.id.clone(),
+                    path: row.path.clone(),
+                    files: row.files.iter().map(|i| files[*i].clone()).collect(),
+                }
+            } else {
+                Selection::CommitFile {
+                    id: history.commit.id.clone(),
+                    parent: details.parent.clone(),
+                    file: files[row.files[0]].clone(),
+                }
+            });
+        }
         Some(if row.directory {
             Selection::Directory(
                 row.path.clone(),
-                row.files
-                    .iter()
-                    .map(|i| snapshot.files[*i].clone())
-                    .collect(),
+                row.files.iter().map(|i| files[*i].clone()).collect(),
                 self.tab == Tab::Staged,
             )
         } else {
-            Selection::File(
-                snapshot.files[row.files[0]].clone(),
-                self.tab == Tab::Staged,
-            )
+            Selection::File(files[row.files[0]].clone(), self.tab == Tab::Staged)
         })
     }
 
     pub fn tree_rows(&self) -> Vec<crate::tree::Row> {
-        if self.tab == Tab::Log {
+        if self.commit_list()
+            || self.snapshot.is_none()
+            || self.history.as_ref().is_some_and(|h| h.details.is_none())
+        {
             return Vec::new();
         }
-        self.snapshot
-            .as_ref()
-            .map(|snapshot| {
-                crate::tree::rows(
-                    &snapshot.files,
-                    &self.items(),
-                    &self.collapsed[(self.tab == Tab::Staged) as usize],
-                )
-            })
-            .unwrap_or_default()
+        crate::tree::rows(
+            self.files(),
+            &self.items(),
+            &self.collapsed[self.tree_index()],
+        )
     }
 
     fn item_count(&self) -> usize {
-        if self.tab == Tab::Log {
+        if self.commit_list() {
             self.items().len()
         } else {
             self.tree_rows().len()
@@ -179,6 +236,7 @@ impl App {
     }
 
     fn switch_tab(&mut self, tab: Tab) {
+        self.history = None;
         self.tab = tab;
         self.selected = 0;
         self.filter.clear();
@@ -187,18 +245,74 @@ impl App {
         self.load_preview();
     }
 
+    fn open_history(&mut self) {
+        let Some(Selection::Commit(id)) = self.selection() else {
+            return;
+        };
+        let Some(commit) = self
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.commits.iter().find(|c| c.id == id))
+            .cloned()
+        else {
+            return;
+        };
+        self.history_generation += 1;
+        self.history = Some(History {
+            commit,
+            details: None,
+            token: self.history_generation,
+            return_selected: self.selected,
+            return_filter: std::mem::take(&mut self.filter),
+            return_list_state: std::mem::take(&mut self.list_state),
+        });
+        self.collapsed[2].clear();
+        self.selected = 0;
+        self.list_focus = true;
+        self.load_preview();
+        self.notice("Loading commit files…", false);
+        let _ = self
+            .sender
+            .send(Request::CommitFiles(self.history_generation, id));
+    }
+
+    fn leave_history(&mut self) {
+        if let Some(history) = self.history.take() {
+            self.filter = history.return_filter;
+            self.selected = self
+                .items()
+                .iter()
+                .position(|index| {
+                    self.snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.commits[*index].id == history.commit.id)
+                })
+                .unwrap_or(history.return_selected);
+            self.list_state = history.return_list_state;
+            self.list_focus = true;
+            self.load_preview();
+            self.notice("History · Enter opens commit files", false);
+        }
+    }
+
     fn reveal_matches(&mut self) {
-        if self.filter.is_empty() || self.tab == Tab::Log {
+        if self.filter.is_empty() || self.commit_list() {
             return;
         }
-        if let Some(snapshot) = &self.snapshot {
-            let indices = self.items();
-            let collapsed = &mut self.collapsed[(self.tab == Tab::Staged) as usize];
-            for index in indices {
-                for parent in snapshot.files[index].path.ancestors().skip(1) {
-                    collapsed.remove(parent);
-                }
-            }
+        let parents: Vec<_> = self
+            .items()
+            .iter()
+            .flat_map(|index| {
+                self.files()[*index]
+                    .path
+                    .ancestors()
+                    .skip(1)
+                    .map(|p| p.to_owned())
+            })
+            .collect();
+        let tree = self.tree_index();
+        for parent in parents {
+            self.collapsed[tree].remove(&parent);
         }
     }
 
@@ -214,7 +328,8 @@ impl App {
             }
             return;
         };
-        let collapsed = &mut self.collapsed[(self.tab == Tab::Staged) as usize];
+        let tree = self.tree_index();
+        let collapsed = &mut self.collapsed[tree];
         if row.directory && (toggle || (open && !row.expanded) || (!open && row.expanded)) {
             if row.expanded {
                 collapsed.insert(row.path.clone());
@@ -251,7 +366,7 @@ impl App {
         self.horizontal = 0;
         self.chunk = 0;
         self.whole_sources = false;
-        self.preview_loading = false;
+        self.preview_loading = self.history.as_ref().is_some_and(|h| h.details.is_none());
         if let Some(selection) = self.selection() {
             self.preview_loading = true;
             let _ = self
@@ -289,8 +404,14 @@ impl App {
                                     }
                                     selection => {
                                         let (path, directory) = match selection {
-                                            Selection::File(file, _) => (file.path, false),
-                                            Selection::Directory(path, ..) => (path, true),
+                                            Selection::File(file, _)
+                                            | Selection::CommitFile { file, .. } => {
+                                                (file.path, false)
+                                            }
+                                            Selection::Directory(path, ..)
+                                            | Selection::CommitDirectory { path, .. } => {
+                                                (path, true)
+                                            }
                                             _ => unreachable!(),
                                         };
                                         let rows = self.tree_rows();
@@ -333,6 +454,26 @@ impl App {
                     match result {
                         Ok(preview) => self.preview = Some(preview),
                         Err(error) => self.notice(error, true),
+                    }
+                }
+                Response::CommitFiles(token, result)
+                    if self
+                        .history
+                        .as_ref()
+                        .is_some_and(|history| history.token == token) =>
+                {
+                    match result {
+                        Ok(details) => {
+                            if let Some(history) = &mut self.history {
+                                history.details = Some(details);
+                            }
+                            self.notice("Commit files · Esc returns to commits", false);
+                            self.load_preview();
+                        }
+                        Err(error) => {
+                            self.leave_history();
+                            self.notice(error, true);
+                        }
                     }
                 }
                 Response::Failed(error) => {
@@ -382,9 +523,9 @@ impl App {
                 .min(u16::MAX as usize)
         } else {
             preview
-                .text
-                .lines()
-                .count()
+                .styled()
+                .lines
+                .len()
                 .saturating_sub(1)
                 .min(u16::MAX as usize)
         }
@@ -511,10 +652,15 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
+                if self.list_focus && self.commit_list() =>
+            {
+                self.open_history()
+            }
             KeyCode::Char('h') | KeyCode::Left => self.tree_key(false, false),
             KeyCode::Char('l') | KeyCode::Right if self.list_focus => self.tree_key(true, false),
             KeyCode::Char('l') | KeyCode::Right => {}
-            KeyCode::Enter | KeyCode::Char(' ') if self.list_focus && self.tab != Tab::Log => {
+            KeyCode::Enter | KeyCode::Char(' ') if self.list_focus && !self.commit_list() => {
                 self.tree_key(true, true)
             }
             KeyCode::Enter => self.list_focus = false,
@@ -565,12 +711,18 @@ impl App {
                 input.insert(&self.filter, false);
                 self.mode = Mode::Search(input);
             }
+            KeyCode::Esc | KeyCode::Backspace if self.history.is_some() => {
+                self.leave_history();
+            }
             KeyCode::Esc => {
                 self.filter.clear();
                 self.list_focus = true;
                 self.load_preview();
             }
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('s' | 'u' | 'c' | 'e') if self.tab == Tab::Log => {
+                self.notice("History is read-only", false);
+            }
             KeyCode::Char('s' | 'u') if !self.busy => {
                 let selection = match self.selection() {
                     Some(Selection::File(file, staged)) => Some((vec![file], staged)),

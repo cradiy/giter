@@ -84,11 +84,26 @@ pub struct Snapshot {
     pub commits: Vec<Commit>,
 }
 
+pub struct CommitDetails {
+    pub parent: Option<String>,
+    pub files: Vec<File>,
+}
+
 #[derive(Clone)]
 pub enum Selection {
     File(File, bool),
     Directory(PathBuf, Vec<File>, bool),
     Commit(String),
+    CommitFile {
+        id: String,
+        parent: Option<String>,
+        file: File,
+    },
+    CommitDirectory {
+        id: String,
+        path: PathBuf,
+        files: Vec<File>,
+    },
 }
 
 pub struct ConflictView {
@@ -258,37 +273,134 @@ impl Repo {
         Ok(display_content(fs::read(path)?))
     }
 
+    pub fn commit_files(&self, id: &str) -> Result<CommitDetails> {
+        let parents = self.strings(&["rev-list", "--parents", "-n", "1", id])?;
+        let parent = std::str::from_utf8(&parents)?
+            .split_whitespace()
+            .nth(1)
+            .map(str::to_owned);
+        let mut args = vec![
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            "-z",
+            "--find-renames",
+        ];
+        if let Some(parent) = &parent {
+            args.push(parent);
+        }
+        args.push(id);
+        args.push("--");
+        let changes = self.strings(&args)?;
+        let mut records = changes.split(|b| *b == 0).filter(|s| !s.is_empty());
+        let mut files = Vec::new();
+        while let Some(status) = records.next() {
+            let status = *status.first().context("Invalid commit file status")? as char;
+            let path = PathBuf::from(os_string(
+                records.next().context("Missing commit file path")?,
+            ));
+            let (path, original) = if matches!(status, 'R' | 'C') {
+                (
+                    PathBuf::from(os_string(
+                        records.next().context("Missing rename destination")?,
+                    )),
+                    Some(path),
+                )
+            } else {
+                (path, None)
+            };
+            files.push(File {
+                path,
+                original,
+                index: status,
+                worktree: ' ',
+            });
+        }
+        Ok(CommitDetails { parent, files })
+    }
+
+    fn directory_preview(
+        &self,
+        path: &Path,
+        files: &[File],
+        staged: bool,
+        commit: Option<&str>,
+    ) -> Preview {
+        let name = if path.as_os_str().is_empty() {
+            self.root
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            path.display().to_string()
+        };
+        let mut text = format!("Directory {name}/\n\n{} changed files\n", files.len());
+        for status in [
+            "Added", "Modified", "Deleted", "Renamed", "Copied", "Conflict",
+        ] {
+            let count = files.iter().filter(|f| f.status(staged) == status).count();
+            if count > 0 {
+                text.push_str(&format!("{status}: {count}\n"));
+            }
+        }
+        if let Some(id) = commit {
+            text.push_str(&format!(
+                "\nCommit {} · select a file to inspect its changes.\n\n",
+                &id[..8]
+            ));
+        } else {
+            text.push_str(&format!(
+                "\n{} affects all {} listed files, including collapsed descendants.\n\n",
+                if staged { "u: unstage" } else { "s: stage" },
+                files.len()
+            ));
+        }
+        for file in files {
+            text.push_str(&format!("{:<9} {}\n", file.status(staged), file.label()));
+        }
+        Preview {
+            title: format!("{name}/"),
+            text,
+            conflict: None,
+            code_path: None,
+            styles: OnceLock::new(),
+        }
+    }
+
     pub fn preview(&self, selection: &Selection) -> Result<Preview> {
         match selection {
             Selection::Directory(path, files, staged) => {
-                let name = if path.as_os_str().is_empty() {
-                    self.root
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
+                Ok(self.directory_preview(path, files, *staged, None))
+            }
+            Selection::CommitDirectory { id, path, files } => {
+                Ok(self.directory_preview(path, files, true, Some(id)))
+            }
+            Selection::CommitFile { id, parent, file } => {
+                let mut args = vec![
+                    OsStr::new(if parent.is_some() { "diff" } else { "show" }),
+                    OsStr::new("--no-ext-diff"),
+                    OsStr::new("--no-textconv"),
+                    OsStr::new("--no-color"),
+                    OsStr::new("--find-renames"),
+                ];
+                if let Some(parent) = parent {
+                    args.push(OsStr::new(parent));
                 } else {
-                    path.display().to_string()
-                };
-                let mut text = format!("Directory {name}/\n\n{} changed files\n", files.len());
-                for status in [
-                    "Added", "Modified", "Deleted", "Renamed", "Copied", "Conflict",
-                ] {
-                    let count = files.iter().filter(|f| f.status(*staged) == status).count();
-                    if count > 0 {
-                        text.push_str(&format!("{status}: {count}\n"));
-                    }
+                    args.push(OsStr::new("--format="));
+                    args.push(OsStr::new("--root"));
                 }
-                text.push_str(&format!(
-                    "\n{} affects all {} listed files, including collapsed descendants.\n\n",
-                    if *staged { "u: unstage" } else { "s: stage" },
-                    files.len()
-                ));
-                for file in files {
-                    text.push_str(&format!("{:<9} {}\n", file.status(*staged), file.label()));
+                args.push(OsStr::new(id));
+                args.push(OsStr::new("--"));
+                args.push(file.path.as_os_str());
+                if let Some(original) = &file.original {
+                    args.push(original.as_os_str());
                 }
+                let text = String::from_utf8_lossy(&self.run(&args)?).into_owned();
                 Ok(Preview {
-                    title: format!("{name}/"),
+                    title: format!("{} · {}", file.label(), &id[..8]),
                     text,
                     conflict: None,
                     code_path: None,
@@ -299,8 +411,7 @@ impl Repo {
                 let text = self.strings(&[
                     "show",
                     "--format=fuller",
-                    "--stat",
-                    "--patch",
+                    "--no-patch",
                     "--no-ext-diff",
                     "--no-textconv",
                     id,
@@ -551,6 +662,7 @@ fn parse_status(bytes: &[u8]) -> Result<Vec<File>> {
 pub enum Request {
     Refresh,
     Preview(u64, Selection),
+    CommitFiles(u64, String),
     Stage(Vec<File>),
     Unstage(Vec<File>),
     Commit(String),
@@ -559,6 +671,7 @@ pub enum Request {
 pub enum Response {
     Snapshot(Result<Snapshot, String>, Option<String>),
     Preview(u64, Result<Preview, String>),
+    CommitFiles(u64, Result<CommitDetails, String>),
     Failed(String),
 }
 
@@ -589,6 +702,10 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
                             preview.styled();
                         })
                         .map_err(|e| format!("{e:#}")),
+                ),
+                Request::CommitFiles(token, id) => Response::CommitFiles(
+                    token,
+                    repo.commit_files(&id).map_err(|e| format!("{e:#}")),
                 ),
                 request => {
                     let (result, message) = match request {
@@ -802,5 +919,129 @@ mod tests {
         );
         assert!(!repo.root.join("src/nested/remove.rs").exists());
         assert!(repo.root.join("src/nested/新\n文件.rs").exists());
+    }
+
+    #[test]
+    fn historical_files_and_patches_ignore_current_index_and_worktree() {
+        let (_dir, repo) = fixture();
+        fs::create_dir(repo.root.join("src")).unwrap();
+        fs::write(repo.root.join("src/旧\n名字.rs"), "fn original() {}\n").unwrap();
+        fs::write(repo.root.join("gone.txt"), "deleted content\n").unwrap();
+        fs::write(repo.root.join("other.txt"), "before\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("root").unwrap();
+        let root = String::from_utf8(repo.strings(&["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        let details = repo.commit_files(&root).unwrap();
+        assert!(details.parent.is_none());
+        assert_eq!(details.files.len(), 3);
+        assert!(details.files.iter().all(|file| file.index == 'A'));
+        let file = details
+            .files
+            .iter()
+            .find(|file| file.path.starts_with("src"))
+            .unwrap()
+            .clone();
+        let preview = repo
+            .preview(&Selection::CommitFile {
+                id: root.clone(),
+                parent: None,
+                file,
+            })
+            .unwrap();
+        assert!(preview.text.contains("+fn original() {}"));
+        assert!(!preview.text.contains("gone.txt"));
+
+        repo.strings(&["mv", "src/旧\n名字.rs", "src/新名字.rs"])
+            .unwrap();
+        fs::remove_file(repo.root.join("gone.txt")).unwrap();
+        fs::write(repo.root.join("other.txt"), "historical change\n").unwrap();
+        fs::write(repo.root.join("added.txt"), "new historical file\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("second").unwrap();
+        let id = String::from_utf8(repo.strings(&["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        let details = repo.commit_files(&id).unwrap();
+        assert_eq!(details.parent.as_deref(), Some(root.as_str()));
+        assert_eq!(details.files.len(), 4);
+        let renamed = details.files.iter().find(|file| file.index == 'R').unwrap();
+        assert_eq!(
+            renamed.original.as_deref(),
+            Some(Path::new("src/旧\n名字.rs"))
+        );
+        fs::write(repo.root.join("other.txt"), "INDEX ONLY\n").unwrap();
+        repo.strings(&["add", "other.txt"]).unwrap();
+        fs::write(repo.root.join("other.txt"), "WORKTREE ONLY\n").unwrap();
+        fs::remove_file(repo.root.join("src/新名字.rs")).unwrap();
+        let before = repo.strings(&["status", "--porcelain=v1", "-z"]).unwrap();
+        for file in details.files {
+            let kind = file.index;
+            let preview = repo
+                .preview(&Selection::CommitFile {
+                    id: id.clone(),
+                    parent: details.parent.clone(),
+                    file,
+                })
+                .unwrap();
+            assert_eq!(preview.text.matches("diff --git ").count(), 1);
+            assert!(!preview.text.contains("INDEX ONLY"));
+            assert!(!preview.text.contains("WORKTREE ONLY"));
+            match kind {
+                'R' => assert!(preview.text.contains("rename from ")),
+                'D' => assert!(preview.text.contains("-deleted content")),
+                'M' => assert!(preview.text.contains("+historical change")),
+                'A' => assert!(preview.text.contains("+new historical file")),
+                _ => panic!("Unexpected historical status"),
+            }
+        }
+        let summary = repo.preview(&Selection::Commit(id)).unwrap();
+        assert!(!summary.text.contains("diff --git"));
+        assert_eq!(
+            repo.strings(&["status", "--porcelain=v1", "-z"]).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn merge_history_compares_first_parent_and_empty_commits_have_no_files() {
+        let (_dir, repo) = fixture();
+        fs::write(repo.root.join("base.txt"), "base\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("base").unwrap();
+        repo.strings(&["checkout", "-b", "topic"]).unwrap();
+        fs::write(repo.root.join("incoming.txt"), "incoming\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("incoming").unwrap();
+        repo.strings(&["checkout", "main"]).unwrap();
+        fs::write(repo.root.join("own.txt"), "own\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("own").unwrap();
+        repo.strings(&["merge", "--no-ff", "-m", "merge topic", "topic"])
+            .unwrap();
+        let id = String::from_utf8(repo.strings(&["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        let details = repo.commit_files(&id).unwrap();
+        assert_eq!(details.files.len(), 1);
+        assert_eq!(details.files[0].path, Path::new("incoming.txt"));
+        let parent = String::from_utf8(repo.strings(&["rev-parse", "HEAD^1"]).unwrap()).unwrap();
+        assert_eq!(details.parent.as_deref(), Some(parent.trim()));
+        let preview = repo
+            .preview(&Selection::CommitFile {
+                id,
+                parent: details.parent,
+                file: details.files[0].clone(),
+            })
+            .unwrap();
+        assert!(preview.text.contains("+incoming"));
+        assert!(!preview.text.contains("own.txt"));
+        repo.strings(&["commit", "--allow-empty", "-m", "empty"])
+            .unwrap();
+        assert!(repo.commit_files("HEAD").unwrap().files.is_empty());
     }
 }
