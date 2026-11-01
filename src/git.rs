@@ -201,6 +201,7 @@ impl Repo {
             .arg("-C")
             .arg(&self.root)
             .args(["-c", "color.ui=false", "-c", "core.quotepath=false"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0");
         command
     }
@@ -226,6 +227,27 @@ impl Repo {
     fn head_exists(&self) -> bool {
         self.strings(&["rev-parse", "--verify", "-q", "HEAD"])
             .is_ok()
+    }
+
+    pub fn watch_git_dirs(&self) -> Result<BTreeSet<PathBuf>> {
+        ["--absolute-git-dir", "--git-common-dir"]
+            .into_iter()
+            .map(|option| {
+                let bytes = self.strings(&["rev-parse", "--path-format=absolute", option])?;
+                Ok(PathBuf::from(os_string(
+                    bytes.strip_suffix(b"\n").unwrap_or(&bytes),
+                )))
+            })
+            .collect()
+    }
+
+    pub fn tracked_paths(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .strings(&["ls-files", "--cached", "-z"])?
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| self.root.join(os_string(path)))
+            .collect())
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
@@ -1061,6 +1083,7 @@ fn parse_file_history(bytes: &[u8]) -> Result<Vec<FileCommit>> {
 
 pub enum Request {
     Refresh,
+    AutoRefresh,
     Preview(u64, Selection),
     CommitFiles(u64, String),
     FileHistory(u64, PathBuf, Option<String>),
@@ -1071,7 +1094,7 @@ pub enum Request {
 }
 
 pub enum Response {
-    Snapshot(Result<Snapshot, String>, Option<String>),
+    Snapshot(Result<Snapshot, String>, Option<String>, bool),
     Preview(u64, Result<Preview, String>),
     CommitFiles(u64, Result<CommitDetails, String>),
     FileHistory(u64, Result<Vec<FileCommit>, String>),
@@ -1096,9 +1119,11 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
                 }
             }
             let response = match request {
-                Request::Refresh => {
-                    Response::Snapshot(repo.snapshot().map_err(|e| format!("{e:#}")), None)
-                }
+                Request::Refresh | Request::AutoRefresh => Response::Snapshot(
+                    repo.snapshot().map_err(|e| format!("{e:#}")),
+                    None,
+                    matches!(request, Request::AutoRefresh),
+                ),
                 Request::Preview(id, selection) => Response::Preview(
                     id,
                     repo.preview(&selection)
@@ -1131,6 +1156,7 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
                         Ok(()) => Response::Snapshot(
                             repo.snapshot().map_err(|e| format!("{e:#}")),
                             Some(message.into()),
+                            false,
                         ),
                         Err(error) => Response::Failed(format!("{error:#}")),
                     }

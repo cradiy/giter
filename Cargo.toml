@@ -9,6 +9,8 @@ license = "MIT"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
+ignore = "0.4"
+notify = "8.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 unicode-segmentation = "1.13"

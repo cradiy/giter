@@ -71,6 +71,7 @@ pub struct FileHistory {
     return_filter: String,
     return_list_state: ListState,
     return_focus: bool,
+    refreshing: bool,
 }
 
 pub struct StashView {
@@ -116,6 +117,8 @@ pub struct App {
     generation: u64,
     pending_g: bool,
     committing: bool,
+    watch_pending: bool,
+    watch_refreshing: bool,
 }
 
 impl App {
@@ -155,6 +158,8 @@ impl App {
             generation: 0,
             pending_g: false,
             committing: false,
+            watch_pending: false,
+            watch_refreshing: false,
         };
         let _ = app.sender.send(Request::Refresh);
         app
@@ -637,11 +642,13 @@ impl App {
             return_filter: std::mem::take(&mut self.filter),
             return_list_state: std::mem::take(&mut self.list_state),
             return_focus: self.list_focus,
+            refreshing: false,
         });
         view.path = path;
         view.query_path = query_path.clone();
         view.start = start.clone();
         view.entries = None;
+        view.refreshing = false;
         view.token = self.history_generation;
         self.file_history = Some(view);
         if let Some(index) = self.repository_rows().iter().position(|row| {
@@ -879,8 +886,16 @@ impl App {
         while let Ok(response) = self.receiver.try_recv() {
             changed = true;
             match response {
-                Response::Snapshot(result, message) => {
-                    self.busy = false;
+                Response::Snapshot(result, message, automatic) => {
+                    if automatic {
+                        self.watch_refreshing = false;
+                        if self.busy || !matches!(self.mode, Mode::Normal) {
+                            self.watch_pending = true;
+                            continue;
+                        }
+                    } else {
+                        self.busy = false;
+                    }
                     // A successful write must not be retried if the following refresh fails.
                     if self.committing && message.is_some() {
                         self.mode = Mode::Normal;
@@ -888,8 +903,28 @@ impl App {
                     }
                     match result {
                         Ok(snapshot) => {
+                            let head_changed = self
+                                .snapshot
+                                .as_ref()
+                                .and_then(|s| s.commits.first().map(|c| &c.id))
+                                != snapshot.commits.first().map(|c| &c.id);
                             let previous = self.selection();
                             self.snapshot = Some(snapshot);
+                            if let Some(stash) = &mut self.stash {
+                                stash.item.reference = self
+                                    .snapshot
+                                    .as_ref()
+                                    .and_then(|snapshot| {
+                                        snapshot
+                                            .stashes
+                                            .iter()
+                                            .find(|item| item.id == stash.item.id)
+                                    })
+                                    .map_or_else(
+                                        || "Dropped stash".into(),
+                                        |item| item.reference.clone(),
+                                    );
+                            }
                             if let Some(previous) = previous {
                                 match previous {
                                     Selection::Stash(item) => {
@@ -949,7 +984,11 @@ impl App {
                                                 })
                                             })
                                         {
-                                            self.selected = position;
+                                            if self.tab == Tab::Files && self.file_tree_focus {
+                                                self.repository_selected = position;
+                                            } else {
+                                                self.selected = position;
+                                            }
                                         }
                                     }
                                 }
@@ -958,8 +997,17 @@ impl App {
                                 self.mode = Mode::Normal;
                                 self.committing = false;
                             }
-                            self.notice(message.unwrap_or_default(), false);
-                            self.load_preview();
+                            if automatic {
+                                if head_changed {
+                                    self.reload_file_history();
+                                }
+                                if self.history.is_none() && self.stash.is_none() {
+                                    self.reload_preview();
+                                }
+                            } else {
+                                self.notice(message.unwrap_or_default(), false);
+                                self.load_preview();
+                            }
                         }
                         Err(error) => {
                             self.committing = false;
@@ -970,7 +1018,16 @@ impl App {
                 Response::Preview(id, result) if id == self.generation => {
                     self.preview_loading = false;
                     match result {
-                        Ok(preview) => self.preview = Some(preview),
+                        Ok(preview) => {
+                            self.chunk = self.chunk.min(
+                                preview
+                                    .conflict
+                                    .as_ref()
+                                    .map_or(0, |conflict| conflict.chunks.len().saturating_sub(1)),
+                            );
+                            self.preview = Some(preview);
+                            self.scroll = self.scroll.min(self.max_scroll());
+                        }
                         Err(error) => self.notice(error, true),
                     }
                 }
@@ -1003,13 +1060,34 @@ impl App {
                     match result {
                         Ok(entries) => {
                             let count = entries.len();
+                            let selected_id = self
+                                .items()
+                                .get(self.selected)
+                                .and_then(|index| self.commit_at(*index))
+                                .map(|commit| commit.id.clone());
+                            let refreshing = self
+                                .file_history
+                                .as_ref()
+                                .is_some_and(|view| view.refreshing);
                             if let Some(view) = &mut self.file_history {
                                 view.entries = Some(entries);
+                                view.refreshing = false;
                             }
-                            self.notice(format!("{count} commits · Tab switches panes"), false);
-                            if self.tab == Tab::Files && self.file_tree_focus {
+                            if refreshing {
+                                self.selected = selected_id
+                                    .and_then(|id| {
+                                        self.items().iter().position(|index| {
+                                            self.commit_at(*index)
+                                                .is_some_and(|commit| commit.id == id)
+                                        })
+                                    })
+                                    .unwrap_or(0);
+                                self.reload_preview();
+                            } else if self.tab == Tab::Files && self.file_tree_focus {
+                                self.notice(format!("{count} commits · Tab switches panes"), false);
                                 self.request_preview(None);
                             } else {
+                                self.notice(format!("{count} commits · Tab switches panes"), false);
                                 self.request_preview(self.file_history_selection());
                             }
                         }
@@ -1047,7 +1125,54 @@ impl App {
                 _ => {}
             }
         }
+        if self.watch_pending
+            && !self.watch_refreshing
+            && !self.busy
+            && !self.preview_loading
+            && matches!(self.mode, Mode::Normal)
+        {
+            self.watch_pending = false;
+            self.watch_refreshing = true;
+            let _ = self.sender.send(Request::AutoRefresh);
+        }
         changed
+    }
+
+    pub fn repository_changed(&mut self) {
+        self.watch_pending = true;
+    }
+
+    fn reload_preview(&mut self) {
+        if self.tab == Tab::Files && self.file_tree_focus {
+            self.sync_repository_history();
+            return;
+        }
+        self.selected = self.selected.min(self.item_count().saturating_sub(1));
+        if let Some(selection) = self.selection() {
+            self.generation += 1;
+            self.preview_loading = true;
+            let _ = self
+                .sender
+                .send(Request::Preview(self.generation, selection));
+        } else {
+            self.load_preview();
+        }
+    }
+
+    fn reload_file_history(&mut self) {
+        if let Some(view) = &mut self.file_history
+            && view.start.is_none()
+            && view.entries.is_some()
+        {
+            self.history_generation += 1;
+            view.token = self.history_generation;
+            view.refreshing = true;
+            let _ = self.sender.send(Request::FileHistory(
+                view.token,
+                view.query_path.clone(),
+                None,
+            ));
+        }
     }
 
     fn move_by(&mut self, amount: isize) {

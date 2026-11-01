@@ -6,6 +6,7 @@ mod input;
 mod theme;
 mod tree;
 mod ui;
+mod watch;
 
 use std::{
     io::{self, IsTerminal},
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "giter requires an interactive terminal"
     );
+    let watch = watch::RepoWatch::new(repo.clone()).context("Cannot watch repository")?;
     let mut terminal = ratatui::init();
     let _guard = TerminalGuard;
     let panic_hook = std::panic::take_hook();
@@ -59,6 +61,16 @@ fn main() -> Result<()> {
     let mut app = App::new(repo);
     let mut dirty = true;
     loop {
+        if let Some(update) = watch.poll() {
+            match update {
+                Ok(()) => app.repository_changed(),
+                Err(error) => {
+                    app.repository_changed();
+                    app.notice(format!("File watch: {error}"), true);
+                    dirty = true;
+                }
+            }
+        }
         dirty |= app.poll();
         if dirty {
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
