@@ -6,7 +6,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -78,12 +78,32 @@ pub struct Commit {
     pub age: String,
 }
 
+#[derive(Clone)]
+pub struct Stash {
+    pub id: String,
+    pub reference: String,
+    pub subject: String,
+    pub author: String,
+    pub age: String,
+}
+
+pub struct StashDetails {
+    pub id: String,
+    pub worktree: CommitDetails,
+    pub index_id: String,
+    pub index: CommitDetails,
+    pub untracked_id: Option<String>,
+    pub untracked: Option<CommitDetails>,
+    pub files: Vec<File>,
+}
+
 pub struct Snapshot {
     pub branch: String,
     pub operation: String,
     pub files: Vec<File>,
     pub committed_files: Vec<File>,
     pub commits: Vec<Commit>,
+    pub stashes: Vec<Stash>,
 }
 
 pub struct CommitDetails {
@@ -104,6 +124,16 @@ pub enum Selection {
     RepositoryFile(File),
     RepositoryDirectory(PathBuf, Vec<File>),
     Commit(String),
+    Stash(Stash),
+    StashFile {
+        details: Arc<StashDetails>,
+        file: File,
+    },
+    StashDirectory {
+        details: Arc<StashDetails>,
+        path: PathBuf,
+        files: Vec<File>,
+    },
     CommitFile {
         id: String,
         parent: Option<String>,
@@ -260,6 +290,116 @@ impl Repo {
             files,
             committed_files,
             commits,
+            stashes: self.stashes()?,
+        })
+    }
+
+    fn stashes(&self) -> Result<Vec<Stash>> {
+        let bytes = self.strings(&[
+            "stash",
+            "list",
+            "-z",
+            "--format=%H%x00%gd%x00%gs%x00%an%x00%ar",
+        ])?;
+        let fields: Vec<_> = bytes.split(|b| *b == 0).collect();
+        Ok(fields
+            .as_chunks::<5>()
+            .0
+            .iter()
+            .map(|fields| Stash {
+                id: String::from_utf8_lossy(fields[0]).into(),
+                reference: String::from_utf8_lossy(fields[1]).into(),
+                subject: String::from_utf8_lossy(fields[2]).into(),
+                author: String::from_utf8_lossy(fields[3]).into(),
+                age: String::from_utf8_lossy(fields[4]).into(),
+            })
+            .collect())
+    }
+
+    pub fn stash_files(&self, id: &str) -> Result<Arc<StashDetails>> {
+        let parents = self.strings(&["rev-list", "--parents", "-n", "1", id])?;
+        let parents: Vec<_> = std::str::from_utf8(&parents)?.split_whitespace().collect();
+        ensure!(matches!(parents.len(), 3 | 4), "Invalid stash snapshot");
+        let worktree = self.commit_files(id)?;
+        let index_id = parents[2].to_owned();
+        let index = self.commit_files(&index_id)?;
+        let untracked_id = parents.get(3).map(|id| id.to_string());
+        let untracked = untracked_id
+            .as_deref()
+            .map(|id| self.commit_files(id))
+            .transpose()?;
+        let mut files = std::collections::BTreeMap::new();
+        for file in worktree
+            .files
+            .iter()
+            .chain(&index.files)
+            .chain(untracked.iter().flat_map(|details| &details.files))
+        {
+            files
+                .entry(file.path.clone())
+                .or_insert_with(|| file.clone());
+        }
+        Ok(Arc::new(StashDetails {
+            id: id.to_owned(),
+            worktree,
+            index_id,
+            index,
+            untracked_id,
+            untracked,
+            files: files.into_values().collect(),
+        }))
+    }
+
+    fn stash_preview(&self, details: &StashDetails, file: &File) -> Result<Preview> {
+        let patch = |id: &str, comparison: &CommitDetails| -> Result<Option<String>> {
+            comparison
+                .files
+                .iter()
+                .find(|entry| entry.path == file.path)
+                .map(|entry| {
+                    self.preview(&Selection::CommitFile {
+                        id: id.to_owned(),
+                        parent: comparison.parent.clone(),
+                        file: entry.clone(),
+                    })
+                    .map(|preview| preview.text)
+                })
+                .transpose()
+        };
+        let worktree = patch(&details.id, &details.worktree)?;
+        let index = patch(&details.index_id, &details.index)?;
+        let untracked = details
+            .untracked_id
+            .as_deref()
+            .zip(details.untracked.as_ref())
+            .map(|(id, comparison)| patch(id, comparison))
+            .transpose()?
+            .flatten();
+        let mut text = String::new();
+        if let Some(worktree) = &worktree {
+            text.push_str(if index.as_ref() == Some(worktree) {
+                "Saved working tree and index\n\n"
+            } else {
+                "Saved working tree\n\n"
+            });
+            text.push_str(worktree);
+        }
+        if let Some(index) = &index
+            && worktree.as_ref() != Some(index)
+        {
+            text.push_str("\nSaved index\n\n");
+            text.push_str(index);
+        }
+        if let Some(untracked) = untracked {
+            text.push_str("\nSaved untracked files\n\n");
+            text.push_str(&untracked);
+        }
+        Ok(Preview {
+            title: format!("{} · stash {}", file.label(), &details.id[..8]),
+            text,
+            conflict: None,
+            code_path: None,
+            styles: OnceLock::new(),
         })
     }
 
@@ -465,6 +605,48 @@ impl Repo {
 
     pub fn preview(&self, selection: &Selection) -> Result<Preview> {
         match selection {
+            Selection::Stash(stash) => {
+                let details = self.stash_files(&stash.id)?;
+                let text = format!(
+                    "{}\n{}\n{} · {}\nSnapshot {}\n\n{}",
+                    stash.reference,
+                    stash.subject,
+                    stash.author,
+                    stash.age,
+                    stash.id,
+                    stash_file_list(&details, &details.files)
+                );
+                Ok(Preview {
+                    title: format!("{} · {}", stash.reference, &stash.id[..8]),
+                    text,
+                    conflict: None,
+                    code_path: None,
+                    styles: OnceLock::new(),
+                })
+            }
+            Selection::StashDirectory {
+                details,
+                path,
+                files,
+            } => {
+                let name = if path.as_os_str().is_empty() {
+                    self.root
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    path.display().to_string()
+                };
+                Ok(Preview {
+                    title: format!("{name}/ · stash {}", &details.id[..8]),
+                    text: stash_file_list(details, files),
+                    conflict: None,
+                    code_path: None,
+                    styles: OnceLock::new(),
+                })
+            }
+            Selection::StashFile { details, file } => self.stash_preview(details, file),
             Selection::Directory(path, files, staged) => {
                 Ok(self.directory_preview(path, files, *staged, None, false))
             }
@@ -743,6 +925,29 @@ fn display_content(bytes: Vec<u8>) -> String {
     }
 }
 
+fn stash_file_list(details: &StashDetails, files: &[File]) -> String {
+    let count = |entries: &[File]| {
+        entries
+            .iter()
+            .filter(|entry| files.iter().any(|file| file.path == entry.path))
+            .count()
+    };
+    let mut text = format!(
+        "Saved working tree: {} files\nSaved index: {} files\nSaved untracked files: {} files\n\nChanged files · {}\n",
+        count(&details.worktree.files),
+        count(&details.index.files),
+        details
+            .untracked
+            .as_ref()
+            .map_or(0, |comparison| count(&comparison.files)),
+        files.len()
+    );
+    for file in files {
+        text.push_str(&format!(" {}  {}\n", file.index, file.label()));
+    }
+    text
+}
+
 #[cfg(unix)]
 fn os_string(bytes: &[u8]) -> OsString {
     use std::os::unix::ffi::OsStringExt;
@@ -859,6 +1064,7 @@ pub enum Request {
     Preview(u64, Selection),
     CommitFiles(u64, String),
     FileHistory(u64, PathBuf, Option<String>),
+    StashFiles(u64, String),
     Stage(Vec<File>),
     Unstage(Vec<File>),
     Commit(String),
@@ -869,6 +1075,7 @@ pub enum Response {
     Preview(u64, Result<Preview, String>),
     CommitFiles(u64, Result<CommitDetails, String>),
     FileHistory(u64, Result<Vec<FileCommit>, String>),
+    StashFiles(u64, Result<Arc<StashDetails>, String>),
     Failed(String),
 }
 
@@ -908,6 +1115,10 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
                     token,
                     repo.file_history(&path, start.as_deref())
                         .map_err(|e| format!("{e:#}")),
+                ),
+                Request::StashFiles(token, id) => Response::StashFiles(
+                    token,
+                    repo.stash_files(&id).map_err(|error| format!("{error:#}")),
                 ),
                 request => {
                     let (result, message) = match request {
@@ -1399,6 +1610,110 @@ mod tests {
                 .unwrap()
                 .text,
             "deleted\n"
+        );
+    }
+
+    #[test]
+    fn stash_inspection_includes_worktree_index_only_and_untracked_changes() {
+        let (_dir, repo) = fixture();
+        for name in ["tracked.txt", "index-only.txt", "deleted.txt", "old.txt"] {
+            fs::write(repo.root.join(name), format!("base {name}\n")).unwrap();
+        }
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("base").unwrap();
+        fs::write(repo.root.join("tracked.txt"), "STAGED VERSION\n").unwrap();
+        fs::write(repo.root.join("index-only.txt"), "INDEX ONLY\n").unwrap();
+        repo.strings(&["add", "tracked.txt", "index-only.txt"])
+            .unwrap();
+        fs::write(repo.root.join("tracked.txt"), "WORKTREE VERSION\n").unwrap();
+        fs::write(repo.root.join("index-only.txt"), "base index-only.txt\n").unwrap();
+        fs::remove_file(repo.root.join("deleted.txt")).unwrap();
+        repo.strings(&["mv", "old.txt", "renamed.txt"]).unwrap();
+        fs::write(repo.root.join("临时\n文件.txt"), "UNTRACKED CONTENT\n").unwrap();
+        repo.strings(&["stash", "push", "--include-untracked", "-m", "all layers"])
+            .unwrap();
+        let item = repo.snapshot().unwrap().stashes.remove(0);
+        assert_eq!(item.reference, "stash@{0}");
+        let details = repo.stash_files(&item.id).unwrap();
+        assert_eq!(details.files.len(), 5);
+        assert!(
+            details
+                .worktree
+                .files
+                .iter()
+                .all(|file| file.path != Path::new("index-only.txt"))
+        );
+        assert!(
+            details
+                .index
+                .files
+                .iter()
+                .any(|file| file.path == Path::new("index-only.txt"))
+        );
+        assert_eq!(details.untracked.as_ref().unwrap().files.len(), 1);
+        fs::write(repo.root.join("tracked.txt"), "CURRENT CONTENT\n").unwrap();
+        let before = repo.strings(&["status", "--porcelain=v1", "-z"]).unwrap();
+        let mut previews = std::collections::BTreeMap::new();
+        for file in &details.files {
+            let preview = repo
+                .preview(&Selection::StashFile {
+                    details: details.clone(),
+                    file: file.clone(),
+                })
+                .unwrap();
+            assert!(!preview.text.contains("CURRENT CONTENT"));
+            previews.insert(file.path.clone(), preview.text);
+        }
+        assert!(previews[Path::new("tracked.txt")].contains("+STAGED VERSION"));
+        assert!(previews[Path::new("tracked.txt")].contains("+WORKTREE VERSION"));
+        assert!(previews[Path::new("index-only.txt")].contains("Saved index"));
+        assert!(previews[Path::new("index-only.txt")].contains("+INDEX ONLY"));
+        assert!(previews[Path::new("临时\n文件.txt")].contains("+UNTRACKED CONTENT"));
+        assert!(previews[Path::new("renamed.txt")].contains("rename from old.txt"));
+        assert!(previews[Path::new("deleted.txt")].contains("-base deleted.txt"));
+        let summary = repo.preview(&Selection::Stash(item)).unwrap();
+        assert!(summary.text.contains("Changed files · 5"));
+        assert!(summary.text.contains("临时\n文件.txt"));
+        assert_eq!(
+            repo.strings(&["status", "--porcelain=v1", "-z"]).unwrap(),
+            before
+        );
+        assert_eq!(repo.snapshot().unwrap().stashes.len(), 1);
+    }
+
+    #[test]
+    fn stash_contents_remain_pinned_when_reflog_indices_change() {
+        let (_dir, repo) = fixture();
+        assert!(repo.snapshot().unwrap().stashes.is_empty());
+        fs::write(repo.root.join("file"), "base\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("base").unwrap();
+        fs::write(repo.root.join("file"), "FIRST STASH\n").unwrap();
+        repo.strings(&["stash", "push", "-m", "first"]).unwrap();
+        let first = repo.snapshot().unwrap().stashes.remove(0);
+        fs::write(repo.root.join("file"), "SECOND STASH\n").unwrap();
+        repo.strings(&["stash", "push", "-m", "second"]).unwrap();
+        let items = repo.snapshot().unwrap().stashes;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].id, first.id);
+        assert_eq!(items[1].reference, "stash@{1}");
+        let details = repo.stash_files(&first.id).unwrap();
+        assert!(details.untracked.is_none());
+        let preview = repo
+            .preview(&Selection::StashFile {
+                details: details.clone(),
+                file: details.files[0].clone(),
+            })
+            .unwrap();
+        assert!(preview.text.contains("+FIRST STASH"));
+        assert!(!preview.text.contains("SECOND STASH"));
+        assert_eq!(
+            repo.preview(&Selection::Stash(first))
+                .unwrap()
+                .text
+                .matches("Changed files")
+                .count(),
+            1
         );
     }
 }

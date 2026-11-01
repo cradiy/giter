@@ -66,6 +66,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
             Style::default().fg(CYAN),
         ));
+    } else if let Some(stash) = &app.stash {
+        header.push(Span::styled(
+            format!(
+                "  Stash / {} · {}",
+                safe(&stash.item.reference),
+                &stash.item.id[..8]
+            ),
+            Style::default().fg(PEACH),
+        ));
     } else if let Some(history) = &app.history {
         header.push(Span::styled(
             format!(
@@ -84,15 +93,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 s.files.iter().filter(|f| f.staged()).count(),
                 s.commits.len(),
                 s.committed_files.len(),
+                s.stashes.len(),
             ]
         })
-        .unwrap_or([0; 4]);
+        .unwrap_or([0; 5]);
     let mut tabs = Vec::new();
     for (i, (tab, name)) in [
         (Tab::Changes, "Changes"),
         (Tab::Staged, "Staged"),
         (Tab::Log, "History"),
         (Tab::Files, "Files"),
+        (Tab::Stash, "Stash"),
     ]
     .into_iter()
     .enumerate()
@@ -102,9 +113,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Tab::Staged => GREEN,
             Tab::Log => PURPLE,
             Tab::Files => CYAN,
+            Tab::Stash => PEACH,
         };
         tabs.push(Span::styled(
-            format!(" {} {name} {} ", i + 1, counts[i]),
+            if area.width < 85 {
+                format!(" {} {name} ", i + 1)
+            } else {
+                format!(" {} {name} {} ", i + 1, counts[i])
+            },
             Style::default()
                 .fg(if app.tab == tab { BG } else { accent })
                 .bg(if app.tab == tab { accent } else { PANEL })
@@ -180,6 +196,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ("?", "help", AMBER),
             ]
         }
+    } else if app.stash_list() {
+        vec![
+            ("j/k", "stashes", BLUE),
+            ("Enter/l", "files", PEACH),
+            ("/", "search", CYAN),
+            ("r", "refresh", TEAL),
+            ("?", "help", AMBER),
+        ]
+    } else if app.stash.is_some() {
+        vec![
+            ("hjkl", "tree", BLUE),
+            ("Enter", "preview", GREEN),
+            ("Esc", "stashes", PEACH),
+            ("/", "search", CYAN),
+            ("?", "help", AMBER),
+        ]
     } else if app.commit_list() {
         vec![
             ("j/k", "commits", BLUE),
@@ -406,7 +438,32 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let indices = app.items();
     let mut items = Vec::new();
     if app.snapshot.is_some() {
-        if app.commit_list() {
+        if app.stash_list() {
+            if let Some(snapshot) = &app.snapshot {
+                for &index in &indices {
+                    let stash = &snapshot.stashes[index];
+                    items.push(ListItem::new(vec![
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{} ", safe(&stash.reference)),
+                                Style::default().fg(PEACH).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(safe(&stash.subject)),
+                        ]),
+                        Line::from(vec![
+                            Span::styled(
+                                format!("  {}", safe(&stash.author)),
+                                Style::default().fg(TEAL),
+                            ),
+                            Span::styled(
+                                format!(" · {}", safe(&stash.age)),
+                                Style::default().fg(MUTED),
+                            ),
+                        ]),
+                    ]));
+                }
+            }
+        } else if app.commit_list() {
             for &index in &indices {
                 let Some(commit) = app.commit_at(index) else {
                     continue;
@@ -447,7 +504,9 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     }
     let title = if app.filter.is_empty() {
-        if app.file_history.is_some() {
+        if app.stash_list() {
+            format!(" Stashes · {} ", indices.len())
+        } else if app.file_history.is_some() {
             format!(
                 " Commits · {} · {} ",
                 app.file_history
@@ -459,6 +518,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             )
         } else if app.commit_list() {
             format!(" Commits · {} ", indices.len())
+        } else if let Some(stash) = &app.stash {
+            format!(
+                " Files · {} · {} ",
+                indices.len(),
+                safe(&stash.item.reference)
+            )
         } else if let Some(history) = &app.history {
             format!(" Files · {} · {} ", indices.len(), &history.commit.id[..8])
         } else {
@@ -493,6 +558,14 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(
             Paragraph::new(if !app.filter.is_empty() {
                 "No matches"
+            } else if app.stash_list() {
+                "No stashes"
+            } else if let Some(stash) = &app.stash {
+                if stash.details.is_none() {
+                    "Loading stash files…"
+                } else {
+                    "No files changed"
+                }
             } else if let Some(history) = &app.file_history {
                 if history.entries.is_none() {
                     "Loading file history…"
@@ -695,12 +768,12 @@ fn render_help(frame: &mut Frame) {
         Line::raw(" gg / G          First / last item or line"),
         Line::raw(" Ctrl+d / Ctrl+u Half page down / up"),
         Line::raw(" H / L           Scroll content horizontally"),
-        Line::raw(" 1 / 2 / 3 / 4   Changes / staged / history / all files"),
+        Line::raw(" 1 / 2 / 3 / 4 / 5  Changes / staged / history / files / stash"),
         Line::raw(" f               Show selected file history"),
         Line::raw(" /               Search current list (Unicode input)"),
         Line::raw(" r               Refresh repository and preview"),
-        Line::raw(" Enter / l       Open selected commit's file tree"),
-        Line::raw(" Esc / Backspace Return from commit files to the log"),
+        Line::raw(" Enter / l       Open selected commit or stash file tree"),
+        Line::raw(" Esc / Backspace Return from commit / stash files to list"),
         Line::raw(" History files are read-only; merge diff uses first parent."),
         Line::raw(""),
         Line::styled(

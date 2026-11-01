@@ -10,7 +10,7 @@ Requires Git, an interactive terminal, and a working tree. The default path is t
 
 ## Workflow
 
-Use `1` for working-tree changes, `2` for staged changes, `3` for the latest 150 commits, and `4` for all repository files. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
+Use `1` for working-tree changes, `2` for staged changes, `3` for the latest 150 commits, `4` for committed repository files, and `5` for stashes. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
 
 Select a file to inspect its diff. Select a directory, including the root, to see its change summary. `s` / `u` stage / unstage all files listed under that directory, including collapsed descendants. With an active search, the scope includes only matching files; matching ancestors expand automatically. Directory staging checks all selected conflicts before updating the index. Git reads and writes run on a worker thread. Press `r` to refresh after external changes.
 
@@ -24,6 +24,12 @@ The tree is read from HEAD and lists committed files only, without working-tree 
 
 In the commit/change view, `j/k` select commits and immediately display their file patches. Enter, `l`, or Tab focuses the patch for scrolling; `h` returns to the commit list, and Esc returns to the file tree. `/` filters commit IDs, subjects, or authors; `r` reloads history. History follows Git-detected renames using each revision's filename, without the main History list's 150-commit cap. From a historical file it starts at the selected commit; otherwise it starts at HEAD. When opened from another tab, Esc from the file tree returns to that tab.
 
+## Stashes
+
+Press `5` to browse the stash list. Selecting a stash shows its message and changed-file summary. Enter or `l` opens its collapsible file tree; selecting a file shows only that file's saved changes. `/` filters stashes or paths, `r` refreshes, and Esc / Backspace returns to the stash list with its selection and search retained.
+
+Stash previews include saved working-tree changes, the saved index, and untracked or ignored files included when the stash was created. Index-only changes remain visible even if the saved working file matches the base. When working-tree and index patches are identical, they share one section. Stashes are inspected through their commit IDs, so content stays pinned if stash numbers change. This view provides inspection only.
+
 | Key | Action |
 | --- | --- |
 | `j/k`, arrows | Move through files or scroll the preview |
@@ -31,8 +37,8 @@ In the commit/change view, `j/k` select commits and immediately display their fi
 | Enter / Space | Toggle selected directory; Enter on a file opens preview |
 | `Tab` | Switch focus between tree and preview |
 | `Ctrl+h/l` | Previous / next tab, wrapping around |
-| Enter / `l` on a commit | Open its changed-file tree |
-| Esc / Backspace in commit files | Return to the commit list |
+| Enter / `l` on a commit or stash | Open its changed-file tree |
+| Esc / Backspace in commit or stash files | Return to its list |
 | Enter / `l` on a file in Files | Move to the commit list and file changes |
 | `f` | Show the selected file's historical commits and patches |
 | `gg`, `G` | First / last item or line |

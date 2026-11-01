@@ -158,7 +158,13 @@ fn patch(text: &str) -> Vec<Line<'static>> {
         .into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let (fg, bg) = if line.starts_with(" A  ") {
+            let (fg, bg) = if line.starts_with("Saved working tree") {
+                (CYAN, PANEL)
+            } else if line.starts_with("Saved index") {
+                (AMBER, PANEL)
+            } else if line.starts_with("Saved untracked") {
+                (GREEN, PANEL)
+            } else if line.starts_with(" A  ") {
                 (GREEN, BG)
             } else if line.starts_with(" M  ") || line.starts_with(" T  ") {
                 (AMBER, BG)

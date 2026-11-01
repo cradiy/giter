@@ -2,7 +2,10 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     path::PathBuf,
-    sync::mpsc::{Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender},
+    },
 };
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -11,7 +14,7 @@ use ratatui::widgets::ListState;
 use crate::{
     git::{
         self, Commit, CommitDetails, File, FileCommit, Preview, Repo, Request, Response, Selection,
-        Snapshot,
+        Snapshot, Stash, StashDetails,
     },
     input::Input,
 };
@@ -22,10 +25,17 @@ pub enum Tab {
     Staged,
     Log,
     Files,
+    Stash,
 }
 
 impl Tab {
-    pub const ALL: [Self; 4] = [Self::Changes, Self::Staged, Self::Log, Self::Files];
+    pub const ALL: [Self; 5] = [
+        Self::Changes,
+        Self::Staged,
+        Self::Log,
+        Self::Files,
+        Self::Stash,
+    ];
 }
 
 pub enum Mode {
@@ -63,6 +73,15 @@ pub struct FileHistory {
     return_focus: bool,
 }
 
+pub struct StashView {
+    pub item: Stash,
+    pub details: Option<Arc<StashDetails>>,
+    token: u64,
+    return_selected: usize,
+    return_filter: String,
+    return_list_state: ListState,
+}
+
 pub struct App {
     pub repo: Repo,
     pub snapshot: Option<Snapshot>,
@@ -84,12 +103,13 @@ pub struct App {
     pub busy: bool,
     pub page_height: usize,
     pub history: Option<History>,
+    pub stash: Option<StashView>,
     pub file_history: Option<FileHistory>,
     pub file_tree_focus: bool,
     pub repository_selected: usize,
     pub repository_filter: String,
     pub repository_state: ListState,
-    collapsed: [HashSet<PathBuf>; 4],
+    collapsed: [HashSet<PathBuf>; 5],
     history_generation: u64,
     sender: Sender<Request>,
     receiver: Receiver<Response>,
@@ -122,6 +142,7 @@ impl App {
             busy: true,
             page_height: 10,
             history: None,
+            stash: None,
             file_history: None,
             file_tree_focus: false,
             repository_selected: 0,
@@ -137,6 +158,10 @@ impl App {
         };
         let _ = app.sender.send(Request::Refresh);
         app
+    }
+
+    pub fn stash_list(&self) -> bool {
+        self.tab == Tab::Stash && self.stash.is_none()
     }
 
     pub fn commit_list(&self) -> bool {
@@ -166,6 +191,12 @@ impl App {
     }
 
     pub fn files(&self) -> &[File] {
+        if let Some(stash) = &self.stash {
+            return stash
+                .details
+                .as_ref()
+                .map_or(&[], |details| details.files.as_slice());
+        }
         if let Some(history) = &self.history {
             history
                 .details
@@ -196,12 +227,33 @@ impl App {
             Tab::Staged => 1,
             Tab::Log => 2,
             Tab::Files => 3,
+            Tab::Stash => 4,
         }
     }
 
     pub fn items(&self) -> Vec<usize> {
         let query = self.filter.to_lowercase();
-        if self.commit_list() {
+        if self.stash_list() {
+            self.snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    snapshot
+                        .stashes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, stash)| {
+                            format!(
+                                "{} {} {} {}",
+                                stash.id, stash.reference, stash.subject, stash.author
+                            )
+                            .to_lowercase()
+                            .contains(&query)
+                        })
+                        .map(|(index, _)| index)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else if self.commit_list() {
             (0..self.commit_count())
                 .filter(|index| {
                     self.commit_at(*index).is_some_and(|commit| {
@@ -217,6 +269,7 @@ impl App {
                 .enumerate()
                 .filter(|(_, file)| {
                     (self.history.is_some()
+                        || self.stash.is_some()
                         || self.tab == Tab::Files
                         || if self.tab == Tab::Changes {
                             file.unstaged()
@@ -242,6 +295,13 @@ impl App {
     }
 
     pub fn selection(&self) -> Option<Selection> {
+        if self.stash_list() {
+            let snapshot = self.snapshot.as_ref()?;
+            return self
+                .items()
+                .get(self.selected)
+                .map(|index| Selection::Stash(snapshot.stashes[*index].clone()));
+        }
         if self.tab == Tab::Files && (self.file_tree_focus || self.file_history.is_none()) {
             return self.repository_selection();
         }
@@ -258,6 +318,25 @@ impl App {
         let rows = self.tree_rows();
         let row = rows.get(self.selected)?;
         let files = self.files();
+        if let Some(stash) = &self.stash {
+            let details = stash.details.as_ref()?.clone();
+            return Some(if row.directory {
+                Selection::StashDirectory {
+                    details,
+                    path: row.path.clone(),
+                    files: row
+                        .files
+                        .iter()
+                        .map(|index| files[*index].clone())
+                        .collect(),
+                }
+            } else {
+                Selection::StashFile {
+                    details,
+                    file: files[row.files[0]].clone(),
+                }
+            });
+        }
         if self.tab == Tab::Files {
             return Some(if row.directory {
                 Selection::RepositoryDirectory(
@@ -300,6 +379,11 @@ impl App {
 
     pub fn tree_rows(&self) -> Vec<crate::tree::Row> {
         if self.commit_list()
+            || self.stash_list()
+            || self
+                .stash
+                .as_ref()
+                .is_some_and(|stash| stash.details.is_none())
             || self.snapshot.is_none()
             || self.history.as_ref().is_some_and(|h| h.details.is_none())
         {
@@ -313,7 +397,7 @@ impl App {
     }
 
     fn item_count(&self) -> usize {
-        if self.commit_list() {
+        if self.commit_list() || self.stash_list() {
             self.items().len()
         } else {
             self.tree_rows().len()
@@ -322,6 +406,7 @@ impl App {
 
     fn switch_tab(&mut self, tab: Tab) {
         self.history = None;
+        self.stash = None;
         self.file_history = None;
         self.tab = tab;
         self.file_tree_focus = tab == Tab::Files;
@@ -600,6 +685,49 @@ impl App {
         }
     }
 
+    fn open_stash(&mut self) {
+        let Some(Selection::Stash(item)) = self.selection() else {
+            return;
+        };
+        self.history_generation += 1;
+        let id = item.id.clone();
+        self.stash = Some(StashView {
+            item,
+            details: None,
+            token: self.history_generation,
+            return_selected: self.selected,
+            return_filter: std::mem::take(&mut self.filter),
+            return_list_state: std::mem::take(&mut self.list_state),
+        });
+        self.selected = 0;
+        self.collapsed[4].clear();
+        self.list_focus = true;
+        self.load_preview();
+        self.notice("Loading stash files…", false);
+        let _ = self
+            .sender
+            .send(Request::StashFiles(self.history_generation, id));
+    }
+
+    fn leave_stash(&mut self) {
+        if let Some(view) = self.stash.take() {
+            self.filter = view.return_filter;
+            self.selected = self
+                .items()
+                .iter()
+                .position(|index| {
+                    self.snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.stashes[*index].id == view.item.id)
+                })
+                .unwrap_or(view.return_selected);
+            self.list_state = view.return_list_state;
+            self.list_focus = true;
+            self.load_preview();
+            self.notice("Stashes · Enter opens changed files", false);
+        }
+    }
+
     fn open_history(&mut self) {
         let Some(Selection::Commit(id)) = self.selection() else {
             return;
@@ -651,7 +779,7 @@ impl App {
     }
 
     fn reveal_matches(&mut self) {
-        if self.filter.is_empty() || self.commit_list() {
+        if self.filter.is_empty() || self.commit_list() || self.stash_list() {
             return;
         }
         let parents: Vec<_> = self
@@ -733,7 +861,11 @@ impl App {
             .file_history
             .as_ref()
             .is_some_and(|h| h.entries.is_none())
-            || self.history.as_ref().is_some_and(|h| h.details.is_none());
+            || self.history.as_ref().is_some_and(|h| h.details.is_none())
+            || self
+                .stash
+                .as_ref()
+                .is_some_and(|stash| stash.details.is_none());
         if let Some(selection) = selection {
             self.preview_loading = true;
             let _ = self
@@ -760,6 +892,15 @@ impl App {
                             self.snapshot = Some(snapshot);
                             if let Some(previous) = previous {
                                 match previous {
+                                    Selection::Stash(item) => {
+                                        if let Some(index) = self.items().iter().position(|index| {
+                                            self.snapshot.as_ref().is_some_and(|snapshot| {
+                                                snapshot.stashes[*index].id == item.id
+                                            })
+                                        }) {
+                                            self.selected = index;
+                                        }
+                                    }
                                     Selection::Commit(id) => {
                                         if let Some(position) = self.items().iter().position(|i| {
                                             self.snapshot
@@ -777,11 +918,13 @@ impl App {
                                         let (path, directory) = match selection {
                                             Selection::File(file, _)
                                             | Selection::RepositoryFile(file)
+                                            | Selection::StashFile { file, .. }
                                             | Selection::CommitFile { file, .. } => {
                                                 (file.path, false)
                                             }
                                             Selection::Directory(path, ..)
                                             | Selection::RepositoryDirectory(path, _)
+                                            | Selection::StashDirectory { path, .. }
                                             | Selection::CommitDirectory { path, .. } => {
                                                 (path, true)
                                             }
@@ -875,6 +1018,26 @@ impl App {
                         }
                         Err(error) => {
                             self.leave_file_history();
+                            self.notice(error, true);
+                        }
+                    }
+                }
+                Response::StashFiles(token, result)
+                    if self
+                        .stash
+                        .as_ref()
+                        .is_some_and(|stash| stash.token == token) =>
+                {
+                    match result {
+                        Ok(details) => {
+                            if let Some(stash) = &mut self.stash {
+                                stash.details = Some(details);
+                            }
+                            self.notice("Stash files · Esc returns to stashes", false);
+                            self.load_preview();
+                        }
+                        Err(error) => {
+                            self.leave_stash();
                             self.notice(error, true);
                         }
                     }
@@ -1063,12 +1226,13 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('1' | '2' | '3' | '4') => {
+            KeyCode::Char('1' | '2' | '3' | '4' | '5') => {
                 let tab = match key.code {
                     KeyCode::Char('1') => Tab::Changes,
                     KeyCode::Char('2') => Tab::Staged,
                     KeyCode::Char('3') => Tab::Log,
-                    _ => Tab::Files,
+                    KeyCode::Char('4') => Tab::Files,
+                    _ => Tab::Stash,
                 };
                 self.switch_tab(tab);
             }
@@ -1103,6 +1267,11 @@ impl App {
                 self.repository_key(true, true)
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
+                if self.list_focus && self.stash_list() =>
+            {
+                self.open_stash()
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
                 if self.list_focus && self.commit_list() =>
             {
                 self.open_history()
@@ -1110,7 +1279,9 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => self.tree_key(false, false),
             KeyCode::Char('l') | KeyCode::Right if self.list_focus => self.tree_key(true, false),
             KeyCode::Char('l') | KeyCode::Right => {}
-            KeyCode::Enter | KeyCode::Char(' ') if self.list_focus && !self.commit_list() => {
+            KeyCode::Enter | KeyCode::Char(' ')
+                if self.list_focus && !self.commit_list() && !self.stash_list() =>
+            {
                 self.tree_key(true, true)
             }
             KeyCode::Enter => self.list_focus = false,
@@ -1181,6 +1352,7 @@ impl App {
                     self.update_filter(String::new());
                 }
             }
+            KeyCode::Esc | KeyCode::Backspace if self.stash.is_some() => self.leave_stash(),
             KeyCode::Esc | KeyCode::Backspace if self.history.is_some() => {
                 self.leave_history();
             }
@@ -1190,7 +1362,9 @@ impl App {
                 self.load_preview();
             }
             KeyCode::Char('r') => self.refresh(),
-            KeyCode::Char('s' | 'u' | 'c' | 'e') if matches!(self.tab, Tab::Log | Tab::Files) => {
+            KeyCode::Char('s' | 'u' | 'c' | 'e')
+                if matches!(self.tab, Tab::Log | Tab::Files | Tab::Stash) =>
+            {
                 self.notice("History is read-only", false);
             }
             KeyCode::Char('s' | 'u') if !self.busy => {
