@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         OnceLock,
@@ -32,6 +32,7 @@ impl File {
             return "Conflict";
         }
         match if staged { self.index } else { self.worktree } {
+            ' ' => "Clean",
             '?' | 'A' => "Added",
             'M' | 'T' => "Modified",
             'D' => "Deleted",
@@ -81,6 +82,7 @@ pub struct Snapshot {
     pub branch: String,
     pub operation: String,
     pub files: Vec<File>,
+    pub committed_files: Vec<File>,
     pub commits: Vec<Commit>,
 }
 
@@ -89,10 +91,18 @@ pub struct CommitDetails {
     pub files: Vec<File>,
 }
 
+pub struct FileCommit {
+    pub commit: Commit,
+    pub parent: Option<String>,
+    pub file: File,
+}
+
 #[derive(Clone)]
 pub enum Selection {
     File(File, bool),
     Directory(PathBuf, Vec<File>, bool),
+    RepositoryFile(File),
+    RepositoryDirectory(PathBuf, Vec<File>),
     Commit(String),
     CommitFile {
         id: String,
@@ -192,6 +202,21 @@ impl Repo {
         let status = self.strings(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
         let mut files = parse_status(&status)?;
         files.sort_by_key(|f| (!f.conflicted(), f.path.clone()));
+        let has_head = self.head_exists();
+        let committed_files = if has_head {
+            self.strings(&["ls-tree", "-r", "--name-only", "-z", "HEAD"])?
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| File {
+                    path: PathBuf::from(os_string(path)),
+                    original: None,
+                    index: ' ',
+                    worktree: ' ',
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let branch = self
             .strings(&["symbolic-ref", "--short", "HEAD"])
             .map(|s| String::from_utf8_lossy(&s).trim().to_owned())
@@ -217,7 +242,7 @@ impl Repo {
             }
         }
         let mut commits = Vec::new();
-        if self.head_exists() {
+        if has_head {
             let log = self.strings(&["log", "-150", "-z", "--format=%H%x00%s%x00%an%x00%ar"])?;
             let fields: Vec<_> = log.split(|b| *b == 0).collect();
             for fields in fields.as_chunks::<4>().0 {
@@ -233,6 +258,7 @@ impl Repo {
             branch,
             operation,
             files,
+            committed_files,
             commits,
         })
     }
@@ -321,12 +347,66 @@ impl Repo {
         Ok(CommitDetails { parent, files })
     }
 
+    pub fn file_history(&self, path: &Path, start: Option<&str>) -> Result<Vec<FileCommit>> {
+        let path = if path.is_absolute() {
+            path.strip_prefix(&self.root)
+                .context("File must be inside this repository")?
+        } else {
+            path
+        };
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    ensure!(normalized.pop(), "File must be inside this repository")
+                }
+                _ => anyhow::bail!("File must be inside this repository"),
+            }
+        }
+        ensure!(
+            !normalized.as_os_str().is_empty(),
+            "Enter a repository-relative file path"
+        );
+        if start.is_none() && !self.head_exists() {
+            return Ok(Vec::new());
+        }
+        let revision = self.strings(&[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            start.unwrap_or("HEAD"),
+        ])?;
+        let revision = std::str::from_utf8(&revision)?.trim();
+        let mut object = OsString::from(format!("{revision}:"));
+        object.push(normalized.as_os_str());
+        if let Ok(kind) = self.run(&[OsStr::new("cat-file"), OsStr::new("-t"), &object]) {
+            ensure!(kind != b"tree\n", "Choose a file rather than a directory");
+        }
+        let log = self.run(&[
+            OsStr::new("log"),
+            OsStr::new("--follow"),
+            OsStr::new("--full-history"),
+            OsStr::new("--diff-merges=first-parent"),
+            OsStr::new("--find-renames"),
+            OsStr::new("-z"),
+            OsStr::new("--name-status"),
+            OsStr::new("--format=%H%x00%s%x00%an%x00%ar%x00%P"),
+            OsStr::new(revision),
+            OsStr::new("--"),
+            normalized.as_os_str(),
+        ])?;
+        parse_file_history(&log)
+    }
+
     fn directory_preview(
         &self,
         path: &Path,
         files: &[File],
         staged: bool,
         commit: Option<&str>,
+        browse: bool,
     ) -> Preview {
         let name = if path.as_os_str().is_empty() {
             self.root
@@ -337,16 +417,25 @@ impl Repo {
         } else {
             path.display().to_string()
         };
-        let mut text = format!("Directory {name}/\n\n{} changed files\n", files.len());
+        let mut text = format!(
+            "Directory {name}/\n\n{} {}\n",
+            files.len(),
+            if browse { "files" } else { "changed files" }
+        );
         for status in [
             "Added", "Modified", "Deleted", "Renamed", "Copied", "Conflict",
         ] {
-            let count = files.iter().filter(|f| f.status(staged) == status).count();
+            let count = files
+                .iter()
+                .filter(|f| f.status(if browse { f.worktree == ' ' } else { staged }) == status)
+                .count();
             if count > 0 {
                 text.push_str(&format!("{status}: {count}\n"));
             }
         }
-        if let Some(id) = commit {
+        if browse {
+            text.push_str("\nSelect a file and press Enter to view its history.\n\n");
+        } else if let Some(id) = commit {
             text.push_str(&format!(
                 "\nCommit {} · select a file to inspect its changes.\n\n",
                 &id[..8]
@@ -359,7 +448,11 @@ impl Repo {
             ));
         }
         for file in files {
-            text.push_str(&format!("{:<9} {}\n", file.status(staged), file.label()));
+            text.push_str(&format!(
+                "{:<9} {}\n",
+                file.status(if browse { file.worktree == ' ' } else { staged }),
+                file.label()
+            ));
         }
         Preview {
             title: format!("{name}/"),
@@ -373,10 +466,32 @@ impl Repo {
     pub fn preview(&self, selection: &Selection) -> Result<Preview> {
         match selection {
             Selection::Directory(path, files, staged) => {
-                Ok(self.directory_preview(path, files, *staged, None))
+                Ok(self.directory_preview(path, files, *staged, None, false))
             }
             Selection::CommitDirectory { id, path, files } => {
-                Ok(self.directory_preview(path, files, true, Some(id)))
+                Ok(self.directory_preview(path, files, true, Some(id), false))
+            }
+            Selection::RepositoryDirectory(path, files) => {
+                Ok(self.directory_preview(path, files, false, None, true))
+            }
+            Selection::RepositoryFile(file) => {
+                let mut object = OsString::from("HEAD:");
+                object.push(file.path.as_os_str());
+                let id = self.run(&[OsStr::new("rev-parse"), OsStr::new("--verify"), &object])?;
+                let id = std::str::from_utf8(&id)?.trim();
+                let kind = self.strings(&["cat-file", "-t", id])?;
+                let text = if kind == b"blob\n" {
+                    self.blob(id)?
+                } else {
+                    format!("[Submodule commit {id}]")
+                };
+                Ok(Preview {
+                    title: file.label(),
+                    text,
+                    conflict: None,
+                    code_path: Some(file.path.clone()),
+                    styles: OnceLock::new(),
+                })
             }
             Selection::CommitFile { id, parent, file } => {
                 let mut args = vec![
@@ -416,9 +531,15 @@ impl Repo {
                     "--no-textconv",
                     id,
                 ])?;
+                let mut text = String::from_utf8_lossy(&text).into_owned();
+                let details = self.commit_files(id)?;
+                text.push_str(&format!("\nChanged files · {}\n", details.files.len()));
+                for file in details.files {
+                    text.push_str(&format!(" {}  {}\n", file.index, file.label()));
+                }
                 Ok(Preview {
                     title: format!("Commit {}", &id[..8]),
-                    text: String::from_utf8_lossy(&text).into(),
+                    text,
                     conflict: None,
                     code_path: None,
                     styles: OnceLock::new(),
@@ -659,10 +780,85 @@ fn parse_status(bytes: &[u8]) -> Result<Vec<File>> {
     Ok(files)
 }
 
+fn parse_file_history(bytes: &[u8]) -> Result<Vec<FileCommit>> {
+    let mut records = bytes.split(|b| *b == 0).peekable();
+    let mut entries = Vec::new();
+    while let Some(id) = records.next() {
+        let id = id.trim_ascii_start();
+        if id.is_empty() {
+            continue;
+        }
+        ensure!(
+            matches!(id.len(), 40 | 64) && id.iter().all(u8::is_ascii_hexdigit),
+            "Invalid file history commit"
+        );
+        let subject = records.next().context("Missing commit subject")?;
+        let author = records.next().context("Missing commit author")?;
+        let age = records.next().context("Missing commit age")?;
+        let parents = records.next().context("Missing commit parents")?;
+        let mut file = None;
+        while let Some(status) = records.peek() {
+            let status = status.trim_ascii_start();
+            if status.is_empty() {
+                records.next();
+                continue;
+            }
+            if matches!(status.len(), 40 | 64) && status.iter().all(u8::is_ascii_hexdigit) {
+                break;
+            }
+            let status = *status.first().context("Missing file status")? as char;
+            ensure!(
+                matches!(status, 'A' | 'M' | 'D' | 'R' | 'C' | 'T'),
+                "Invalid file history status"
+            );
+            records.next();
+            let path = PathBuf::from(os_string(
+                records.next().context("Missing historical path")?,
+            ));
+            let (path, original) = if matches!(status, 'R' | 'C') {
+                (
+                    PathBuf::from(os_string(
+                        records
+                            .next()
+                            .context("Missing historical rename destination")?,
+                    )),
+                    Some(path),
+                )
+            } else {
+                (path, None)
+            };
+            ensure!(file.is_none(), "Expected a single file in followed history");
+            file = Some(File {
+                path,
+                original,
+                index: status,
+                worktree: ' ',
+            });
+        }
+        if let Some(file) = file {
+            entries.push(FileCommit {
+                commit: Commit {
+                    id: String::from_utf8_lossy(id).into(),
+                    subject: String::from_utf8_lossy(subject).into(),
+                    author: String::from_utf8_lossy(author).into(),
+                    age: String::from_utf8_lossy(age).into(),
+                },
+                parent: std::str::from_utf8(parents)?
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_owned),
+                file,
+            });
+        }
+    }
+    Ok(entries)
+}
+
 pub enum Request {
     Refresh,
     Preview(u64, Selection),
     CommitFiles(u64, String),
+    FileHistory(u64, PathBuf, Option<String>),
     Stage(Vec<File>),
     Unstage(Vec<File>),
     Commit(String),
@@ -672,6 +868,7 @@ pub enum Response {
     Snapshot(Result<Snapshot, String>, Option<String>),
     Preview(u64, Result<Preview, String>),
     CommitFiles(u64, Result<CommitDetails, String>),
+    FileHistory(u64, Result<Vec<FileCommit>, String>),
     Failed(String),
 }
 
@@ -706,6 +903,11 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
                 Request::CommitFiles(token, id) => Response::CommitFiles(
                     token,
                     repo.commit_files(&id).map_err(|e| format!("{e:#}")),
+                ),
+                Request::FileHistory(token, path, start) => Response::FileHistory(
+                    token,
+                    repo.file_history(&path, start.as_deref())
+                        .map_err(|e| format!("{e:#}")),
                 ),
                 request => {
                     let (result, message) = match request {
@@ -1000,6 +1202,9 @@ mod tests {
         }
         let summary = repo.preview(&Selection::Commit(id)).unwrap();
         assert!(!summary.text.contains("diff --git"));
+        assert!(summary.text.contains("Changed files · 4"));
+        assert!(summary.text.contains(" M  other.txt"));
+        assert!(summary.text.contains(" D  gone.txt"));
         assert_eq!(
             repo.strings(&["status", "--porcelain=v1", "-z"]).unwrap(),
             before
@@ -1040,8 +1245,160 @@ mod tests {
             .unwrap();
         assert!(preview.text.contains("+incoming"));
         assert!(!preview.text.contains("own.txt"));
+        let history = repo.file_history(Path::new("incoming.txt"), None).unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|entry| entry.commit.subject == "merge topic")
+        );
+        assert!(
+            history
+                .iter()
+                .any(|entry| entry.commit.subject == "incoming")
+        );
+        let merge = history
+            .iter()
+            .find(|entry| entry.commit.subject == "merge topic")
+            .unwrap();
+        assert_eq!(merge.parent.as_deref(), Some(parent.trim()));
         repo.strings(&["commit", "--allow-empty", "-m", "empty"])
             .unwrap();
         assert!(repo.commit_files("HEAD").unwrap().files.is_empty());
+    }
+
+    #[test]
+    fn followed_file_history_tracks_old_paths_deletion_and_single_file_patches() {
+        let (_dir, repo) = fixture();
+        fs::create_dir(repo.root.join("src")).unwrap();
+        let old = "src/:(glob)旧\n名字.rs";
+        let new = "src/新名字.rs";
+        fs::write(repo.root.join(old), "original\n").unwrap();
+        fs::write(repo.root.join("other.txt"), "other\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("create file").unwrap();
+        fs::write(repo.root.join(old), "first edit\n").unwrap();
+        fs::write(repo.root.join("other.txt"), "other edit\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("first edit").unwrap();
+        repo.strings(&["mv", old, new]).unwrap();
+        repo.commit("rename file").unwrap();
+        let rename = String::from_utf8(repo.strings(&["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
+        fs::write(repo.root.join(new), "second edit\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("second edit").unwrap();
+        repo.strings(&["rm", new]).unwrap();
+        repo.commit("delete file").unwrap();
+        fs::write(repo.root.join("other.txt"), "current working content\n").unwrap();
+        let before = repo.strings(&["status", "--porcelain=v1", "-z"]).unwrap();
+        let history = repo.file_history(Path::new(new), None).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.commit.subject.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "delete file",
+                "second edit",
+                "rename file",
+                "first edit",
+                "create file"
+            ]
+        );
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.file.index)
+                .collect::<Vec<_>>(),
+            ['D', 'M', 'R', 'M', 'A']
+        );
+        assert_eq!(history[3].file.path, Path::new(old));
+        assert_eq!(history[2].file.original.as_deref(), Some(Path::new(old)));
+        for entry in &history {
+            let preview = repo
+                .preview(&Selection::CommitFile {
+                    id: entry.commit.id.clone(),
+                    parent: entry.parent.clone(),
+                    file: entry.file.clone(),
+                })
+                .unwrap();
+            assert_eq!(preview.text.matches("diff --git ").count(), 1);
+            assert!(!preview.text.contains("other.txt"));
+            assert!(!preview.text.contains("current working content"));
+        }
+        let anchored = repo.file_history(Path::new(new), Some(&rename)).unwrap();
+        assert_eq!(anchored.len(), 3);
+        assert_eq!(anchored[0].commit.subject, "rename file");
+        assert!(
+            repo.file_history(Path::new("does-not-exist"), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repo.file_history(Path::new("src"), Some(&rename)).is_err());
+        assert!(repo.file_history(Path::new("../outside"), None).is_err());
+        assert_eq!(
+            repo.strings(&["status", "--porcelain=v1", "-z"]).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn repository_browser_uses_head_and_ignores_all_uncommitted_path_and_content_changes() {
+        let (_dir, repo) = fixture();
+        fs::write(repo.root.join("clean.txt"), "clean\n").unwrap();
+        fs::write(repo.root.join("old.txt"), "old\n").unwrap();
+        fs::write(repo.root.join("deleted.txt"), "deleted\n").unwrap();
+        assert!(repo.snapshot().unwrap().committed_files.is_empty());
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("initial").unwrap();
+        fs::write(repo.root.join("clean.txt"), "uncommitted content\n").unwrap();
+        repo.strings(&["mv", "old.txt", "renamed.txt"]).unwrap();
+        fs::write(repo.root.join("new.txt"), "staged addition\n").unwrap();
+        repo.strings(&["add", "new.txt"]).unwrap();
+        fs::write(repo.root.join("untracked.txt"), "untracked\n").unwrap();
+        fs::remove_file(repo.root.join("deleted.txt")).unwrap();
+        let snapshot = repo.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .committed_files
+                .iter()
+                .map(|file| file.path.as_path())
+                .collect::<Vec<_>>(),
+            [
+                Path::new("clean.txt"),
+                Path::new("deleted.txt"),
+                Path::new("old.txt")
+            ]
+        );
+        assert!(
+            snapshot
+                .committed_files
+                .iter()
+                .all(|file| file.status(true) == "Clean" && file.status(false) == "Clean")
+        );
+        let clean = snapshot
+            .committed_files
+            .iter()
+            .find(|file| file.path == Path::new("clean.txt"))
+            .unwrap();
+        assert_eq!(
+            repo.preview(&Selection::RepositoryFile(clean.clone()))
+                .unwrap()
+                .text,
+            "clean\n"
+        );
+        let deleted = snapshot
+            .committed_files
+            .iter()
+            .find(|file| file.path == Path::new("deleted.txt"))
+            .unwrap();
+        assert_eq!(
+            repo.preview(&Selection::RepositoryFile(deleted.clone()))
+                .unwrap()
+                .text,
+            "deleted\n"
+        );
     }
 }

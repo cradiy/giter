@@ -158,7 +158,15 @@ fn patch(text: &str) -> Vec<Line<'static>> {
         .into_iter()
         .enumerate()
         .map(|(i, line)| {
-            let (fg, bg) = if line.starts_with('+') {
+            let (fg, bg) = if line.starts_with(" A  ") {
+                (GREEN, BG)
+            } else if line.starts_with(" M  ") || line.starts_with(" T  ") {
+                (AMBER, BG)
+            } else if line.starts_with(" D  ") {
+                (RED, BG)
+            } else if line.starts_with(" R  ") || line.starts_with(" C  ") {
+                (PURPLE, BG)
+            } else if line.starts_with('+') {
                 (GREEN, ADD_BG)
             } else if line.starts_with('-') {
                 (RED, DELETE_BG)

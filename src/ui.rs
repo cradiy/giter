@@ -58,7 +58,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Style::default().fg(MUTED),
         ),
     ];
-    if let Some(history) = &app.history {
+    if let Some(history) = &app.file_history {
+        header.push(Span::styled(
+            format!(
+                "  File history / {}",
+                safe(&history.path.display().to_string())
+            ),
+            Style::default().fg(CYAN),
+        ));
+    } else if let Some(history) = &app.history {
         header.push(Span::styled(
             format!(
                 "  History / {} · {}",
@@ -75,14 +83,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 s.files.iter().filter(|f| f.unstaged()).count(),
                 s.files.iter().filter(|f| f.staged()).count(),
                 s.commits.len(),
+                s.committed_files.len(),
             ]
         })
-        .unwrap_or([0; 3]);
+        .unwrap_or([0; 4]);
     let mut tabs = Vec::new();
     for (i, (tab, name)) in [
         (Tab::Changes, "Changes"),
         (Tab::Staged, "Staged"),
         (Tab::Log, "History"),
+        (Tab::Files, "Files"),
     ]
     .into_iter()
     .enumerate()
@@ -91,6 +101,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Tab::Changes => BLUE,
             Tab::Staged => GREEN,
             Tab::Log => PURPLE,
+            Tab::Files => CYAN,
         };
         tabs.push(Span::styled(
             format!(" {} {name} {} ", i + 1, counts[i]),
@@ -115,16 +126,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(tabs)), rows[1]);
-    let sidebar = (area.width / 3).clamp(23, 42);
-    let columns =
-        Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(20)]).split(rows[2]);
-    app.page_height = if app.list_focus {
-        columns[0].height.saturating_sub(2) as usize
+    if app.tab == Tab::Files {
+        draw_files(frame, rows[2], app);
     } else {
-        columns[1].height.saturating_sub(2) as usize
-    };
-    render_list(frame, columns[0], app);
-    render_preview(frame, columns[1], app);
+        let sidebar = (area.width / 3).clamp(23, 42);
+        let columns =
+            Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(20)]).split(rows[2]);
+        app.page_height = if app.list_focus {
+            columns[0].height.saturating_sub(2) as usize
+        } else {
+            columns[1].height.saturating_sub(2) as usize
+        };
+        render_list(frame, columns[0], app);
+        render_preview(frame, columns[1], app);
+    }
     frame.render_widget(
         Paragraph::new(format!(
             " {}{}",
@@ -135,7 +150,37 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .wrap(Wrap { trim: false }),
         rows[3],
     );
-    let hints = if app.commit_list() {
+    let hints = if app.tab == Tab::Files {
+        if app.file_tree_focus {
+            let mut hints = vec![
+                ("j/k", "files", BLUE),
+                ("h/l", "folders", BLUE),
+                ("Enter/l", "open history", CYAN),
+                ("/", "find file", PEACH),
+                ("?", "help", AMBER),
+            ];
+            if app.file_history_has_origin() {
+                hints.push(("Esc", "back", PURPLE));
+            }
+            hints
+        } else if app.list_focus {
+            vec![
+                ("j/k", "commits", BLUE),
+                ("l/Enter", "changes", GREEN),
+                ("h/Esc", "files", PURPLE),
+                ("/", "find commit", CYAN),
+                ("?", "help", AMBER),
+            ]
+        } else {
+            vec![
+                ("j/k", "scroll", BLUE),
+                ("h", "commits", PURPLE),
+                ("Esc", "files", CYAN),
+                ("H/L", "horizontal", PEACH),
+                ("?", "help", AMBER),
+            ]
+        }
+    } else if app.commit_list() {
         vec![
             ("j/k", "commits", BLUE),
             ("Enter/l", "files", PURPLE),
@@ -148,6 +193,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         vec![
             ("hjkl", "tree", BLUE),
             ("Enter", "preview", GREEN),
+            ("f", "file history", CYAN),
             ("Esc", "commits", PURPLE),
             ("/", "search", CYAN),
             ("Ctrl+h/l", "tabs", PEACH),
@@ -166,6 +212,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         vec![
             ("hjkl", "move", BLUE),
+            ("f", "history", CYAN),
             ("s", "stage", GREEN),
             ("u", "unstage", PEACH),
             ("c", "commit", PURPLE),
@@ -207,6 +254,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn change_color(status: &str) -> Color {
     match status {
+        "Clean" => FG,
         "Added" => GREEN,
         "Modified" => AMBER,
         "Deleted" => RED,
@@ -218,6 +266,7 @@ fn change_color(status: &str) -> Color {
 
 fn change_symbol(status: &str) -> char {
     match status {
+        "Clean" => '·',
         "Added" => 'A',
         "Modified" => 'M',
         "Deleted" => 'D',
@@ -228,18 +277,158 @@ fn change_symbol(status: &str) -> char {
     }
 }
 
+fn file_items(
+    app: &App,
+    files: &[crate::git::File],
+    rows: Vec<crate::tree::Row>,
+) -> Vec<ListItem<'static>> {
+    let mut items = Vec::new();
+    for row in rows {
+        let mut spans = vec![Span::styled(
+            row.prefix.clone(),
+            Style::default().fg(BORDER),
+        )];
+        if row.directory {
+            let root = row.path.as_os_str().is_empty();
+            let name = if root {
+                app.repo.root.file_name().unwrap_or_default()
+            } else {
+                row.path.file_name().unwrap_or_default()
+            };
+            spans.push(Span::styled(
+                format!(
+                    "{} {}/",
+                    if row.expanded { "▾" } else { "▸" },
+                    safe(&name.to_string_lossy())
+                ),
+                Style::default()
+                    .fg(if root { PURPLE } else { BLUE })
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if app.tab != Tab::Files {
+                for status in [
+                    "Added", "Modified", "Deleted", "Renamed", "Copied", "Conflict",
+                ] {
+                    let count = row
+                        .files
+                        .iter()
+                        .filter(|index| app.file_status(&files[**index]) == status)
+                        .count();
+                    if count > 0 {
+                        spans.push(Span::styled(
+                            format!(" {}{count}", change_symbol(status)),
+                            Style::default().fg(change_color(status)),
+                        ));
+                    }
+                }
+            }
+        } else {
+            let file = &files[row.files[0]];
+            let color = if app.tab == Tab::Files {
+                FG
+            } else {
+                let status = app.file_status(file);
+                let color = change_color(status);
+                spans.push(Span::styled(
+                    format!("{} ", change_symbol(status)),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ));
+                color
+            };
+            spans.push(Span::styled(
+                safe(&file.path.file_name().unwrap_or_default().to_string_lossy()),
+                Style::default().fg(color),
+            ));
+        }
+        items.push(ListItem::new(Line::from(spans)));
+    }
+    items
+}
+
+fn render_repository_list(frame: &mut Frame, area: Rect, app: &mut App) {
+    let rows = app.repository_rows();
+    let count = rows.first().map_or(0, |row| row.files.len());
+    app.repository_selected = app.repository_selected.min(rows.len().saturating_sub(1));
+    let files = app.repository_files();
+    let items = file_items(app, &files, rows);
+    app.repository_state.select(if items.is_empty() {
+        None
+    } else {
+        Some(app.repository_selected)
+    });
+    let title = if app.repository_filter.is_empty() {
+        format!(" Files · {count} ")
+    } else {
+        format!(" / {} · {count} ", safe(&app.repository_filter))
+    };
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block(title, app.file_tree_focus))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(49, 50, 74))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› "),
+        area,
+        &mut app.repository_state,
+    );
+}
+
+fn draw_files(frame: &mut Frame, area: Rect, app: &mut App) {
+    let columns = Layout::horizontal([
+        Constraint::Length((area.width / 3).clamp(26, 48)),
+        Constraint::Min(26),
+    ])
+    .split(area);
+    app.page_height = area.height.saturating_sub(2) as usize;
+    if app.file_tree_focus {
+        render_repository_list(frame, columns[0], app);
+        if app.file_history.is_some() {
+            render_list(frame, columns[1], app);
+        } else {
+            frame.render_widget(
+                Paragraph::new(
+                    "Select a file to see its commits.\n\nEnter opens the commit and change view.",
+                )
+                .block(block(" Commits ", false))
+                .style(Style::default().fg(MUTED)),
+                columns[1],
+            );
+        }
+    } else {
+        render_list(frame, columns[0], app);
+        render_preview(frame, columns[1], app);
+    }
+}
+
 fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let indices = app.items();
     let mut items = Vec::new();
-    if let Some(snapshot) = &app.snapshot {
+    if app.snapshot.is_some() {
         if app.commit_list() {
             for &index in &indices {
-                let commit = &snapshot.commits[index];
+                let Some(commit) = app.commit_at(index) else {
+                    continue;
+                };
+                let mut heading = Vec::new();
+                if let Some(entry) = app
+                    .file_history
+                    .as_ref()
+                    .and_then(|view| view.entries.as_ref())
+                    .and_then(|entries| entries.get(index))
+                {
+                    heading.push(Span::styled(
+                        format!("{} ", change_symbol(entry.file.status(true))),
+                        Style::default().fg(change_color(entry.file.status(true))),
+                    ));
+                }
+                heading.extend([
+                    Span::styled(format!("{} ", &commit.id[..8]), Style::default().fg(PEACH)),
+                    Span::raw(safe(&commit.subject)),
+                ]);
                 items.push(ListItem::new(vec![
-                    Line::from(vec![
-                        Span::styled(format!("{} ", &commit.id[..8]), Style::default().fg(PEACH)),
-                        Span::raw(safe(&commit.subject)),
-                    ]),
+                    Line::from(heading),
                     Line::from(vec![
                         Span::styled(
                             format!("  {}", safe(&commit.author)),
@@ -254,62 +443,21 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         } else {
             let files = app.files();
-            for row in app.tree_rows() {
-                let mut spans = vec![Span::styled(
-                    row.prefix.clone(),
-                    Style::default().fg(BORDER),
-                )];
-                if row.directory {
-                    let root = row.path.as_os_str().is_empty();
-                    let name = if root {
-                        app.repo.root.file_name().unwrap_or_default()
-                    } else {
-                        row.path.file_name().unwrap_or_default()
-                    };
-                    spans.push(Span::styled(
-                        format!(
-                            "{} {}/",
-                            if row.expanded { "▾" } else { "▸" },
-                            safe(&name.to_string_lossy())
-                        ),
-                        Style::default()
-                            .fg(if root { PURPLE } else { BLUE })
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    for status in [
-                        "Added", "Modified", "Deleted", "Renamed", "Copied", "Conflict",
-                    ] {
-                        let count = row
-                            .files
-                            .iter()
-                            .filter(|index| files[**index].status(app.staged_status()) == status)
-                            .count();
-                        if count > 0 {
-                            spans.push(Span::styled(
-                                format!(" {}{count}", change_symbol(status)),
-                                Style::default().fg(change_color(status)),
-                            ));
-                        }
-                    }
-                } else {
-                    let file = &files[row.files[0]];
-                    let status = file.status(app.staged_status());
-                    let color = change_color(status);
-                    spans.push(Span::styled(
-                        format!("{} ", change_symbol(status)),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ));
-                    spans.push(Span::styled(
-                        safe(&file.path.file_name().unwrap_or_default().to_string_lossy()),
-                        Style::default().fg(color),
-                    ));
-                }
-                items.push(ListItem::new(Line::from(spans)));
-            }
+            items = file_items(app, files, app.tree_rows());
         }
     }
     let title = if app.filter.is_empty() {
-        if app.commit_list() {
+        if app.file_history.is_some() {
+            format!(
+                " Commits · {} · {} ",
+                app.file_history
+                    .as_ref()
+                    .and_then(|view| view.path.file_name())
+                    .map(|name| safe(&name.to_string_lossy()))
+                    .unwrap_or_default(),
+                indices.len()
+            )
+        } else if app.commit_list() {
             format!(" Commits · {} ", indices.len())
         } else if let Some(history) = &app.history {
             format!(" Files · {} · {} ", indices.len(), &history.commit.id[..8])
@@ -327,7 +475,10 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let empty = indices.is_empty();
     frame.render_stateful_widget(
         List::new(items)
-            .block(block(title, app.list_focus))
+            .block(block(
+                title,
+                app.list_focus && !(app.tab == Tab::Files && app.file_tree_focus),
+            ))
             .highlight_style(
                 Style::default()
                     .bg(Color::Rgb(49, 50, 74))
@@ -342,6 +493,12 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(
             Paragraph::new(if !app.filter.is_empty() {
                 "No matches"
+            } else if let Some(history) = &app.file_history {
+                if history.entries.is_none() {
+                    "Loading file history…"
+                } else {
+                    "No commits for this file"
+                }
             } else if app.commit_list() {
                 "No commits yet"
             } else if let Some(history) = &app.history {
@@ -361,7 +518,20 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
     let Some(preview) = &app.preview else {
-        frame.render_widget(Paragraph::new(if app.preview_loading { "Loading…" } else { "Select a file or commit\n\n1 Changes   2 Staged   3 History\n\nConflict files appear first.\n? opens keyboard help." }).block(block(" Preview ", !app.list_focus)).style(Style::default().fg(MUTED)), area);
+        frame.render_widget(
+            Paragraph::new(if app.preview_loading {
+                "Loading…"
+            } else if app.file_history.is_some() {
+                "This file has no committed changes yet."
+            } else if app.tab == Tab::Files {
+                "Select a file, then a commit.\n\nThe changes appear here."
+            } else {
+                "Select a file or commit\n\n? opens keyboard help."
+            })
+            .block(block(" Preview ", !app.list_focus))
+            .style(Style::default().fg(MUTED)),
+            area,
+        );
         return;
     };
     if let Some(conflict) = &preview.conflict {
@@ -510,7 +680,7 @@ fn render_input(frame: &mut Frame, input: &Input, title: &'static str, multiline
 }
 
 fn render_help(frame: &mut Frame) {
-    let area = popup(frame.area(), 84, 34);
+    let area = popup(frame.area(), 84, 35);
     frame.render_widget(Clear, area);
     let text = vec![
         Line::styled(
@@ -521,11 +691,12 @@ fn render_help(frame: &mut Frame) {
         Line::raw(" h/l             Collapse / expand; h parent, l enter"),
         Line::raw(" Enter / Space   Toggle directory; Enter file preview"),
         Line::raw(" Ctrl+h / Ctrl+l Previous / next tab"),
-        Line::raw(" Tab             Switch focused pane"),
+        Line::raw(" Tab             Switch visible pane; open file history"),
         Line::raw(" gg / G          First / last item or line"),
         Line::raw(" Ctrl+d / Ctrl+u Half page down / up"),
         Line::raw(" H / L           Scroll content horizontally"),
-        Line::raw(" 1 / 2 / 3       Changes / staged / recent history"),
+        Line::raw(" 1 / 2 / 3 / 4   Changes / staged / history / all files"),
+        Line::raw(" f               Show selected file history"),
         Line::raw(" /               Search current list (Unicode input)"),
         Line::raw(" r               Refresh repository and preview"),
         Line::raw(" Enter / l       Open selected commit's file tree"),

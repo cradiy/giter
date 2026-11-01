@@ -10,11 +10,19 @@ Requires Git, an interactive terminal, and a working tree. The default path is t
 
 ## Workflow
 
-Use `1` for working-tree changes, `2` for staged changes, and `3` for the latest 150 commits. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes and Staged show a collapsible tree rooted at the repository directory, with colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. Directories summarize these letters with counts. Conflict entries and directories containing conflicts sort first.
+Use `1` for working-tree changes, `2` for staged changes, `3` for the latest 150 commits, and `4` for all repository files. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
 
 Select a file to inspect its diff. Select a directory, including the root, to see its change summary. `s` / `u` stage / unstage all files listed under that directory, including collapsed descendants. With an active search, the scope includes only matching files; matching ancestors expand automatically. Directory staging checks all selected conflicts before updating the index. Git reads and writes run on a worker thread. Press `r` to refresh after external changes.
 
-In History, selecting a commit shows its metadata. Press Enter or `l` to browse that commit's changed files in the same collapsible tree. Select a file to see only its patch, with the same status colors and navigation. `/` filters historical paths. Esc or Backspace returns to the commit list and restores its selection and search. Historical views are read-only and use committed content, independent of the current index and working tree. Merge commits compare against their first parent; root commits compare against the empty tree.
+In History, selecting a commit shows its metadata and a list of changed files with `A/M/D/R` statuses. Press Enter or `l` to browse that commit's changed files in the same collapsible tree. Select a file to see only its patch, with the same status colors and navigation. `/` filters historical paths. Esc or Backspace returns to the commit list and restores its selection and search. Historical views are read-only and use committed content, independent of the current index and working tree. Merge commits compare against their first parent; root commits compare against the empty tree.
+
+## File history
+
+The Files tab has two columns: committed file tree on the left, the selected file's commits on the right. Moving to a file loads its commit history. Enter or `l` opens the next view: the commit list moves to the left and that commit's file changes appear on the right. Esc or `h` from the commit list returns to the file tree, preserving the selected file and scroll position.
+
+The tree is read from HEAD and lists committed files only, without working-tree or index statuses. Untracked files, staged additions, and uncommitted renames are excluded. `/` in the tree filters file paths. `f` also opens the selected file's history from Changes, Staged, or a historical commit's file tree.
+
+In the commit/change view, `j/k` select commits and immediately display their file patches. Enter, `l`, or Tab focuses the patch for scrolling; `h` returns to the commit list, and Esc returns to the file tree. `/` filters commit IDs, subjects, or authors; `r` reloads history. History follows Git-detected renames using each revision's filename, without the main History list's 150-commit cap. From a historical file it starts at the selected commit; otherwise it starts at HEAD. When opened from another tab, Esc from the file tree returns to that tab.
 
 | Key | Action |
 | --- | --- |
@@ -25,6 +33,8 @@ In History, selecting a commit shows its metadata. Press Enter or `l` to browse 
 | `Ctrl+h/l` | Previous / next tab, wrapping around |
 | Enter / `l` on a commit | Open its changed-file tree |
 | Esc / Backspace in commit files | Return to the commit list |
+| Enter / `l` on a file in Files | Move to the commit list and file changes |
+| `f` | Show the selected file's historical commits and patches |
 | `gg`, `G` | First / last item or line |
 | `Ctrl+d/u`, Page Down/Up | Scroll half / full page |
 | `H/L` | Scroll content horizontally |
@@ -58,7 +68,7 @@ Configure the input method in your terminal emulator. The terminal handles IME p
 
 ## Scope
 
-This version supports file and directory staging/unstaging, commit creation, recent commit inspection, conflict inspection, and external editing. It does not provide hunk staging, branch switching, fetch/push, or an embedded merge editor. Repository changes are refreshed explicitly. Commit hooks and signing use your Git configuration; Git subprocesses do not have an interactive terminal.
+This version supports file and directory staging/unstaging, commit creation, recent commit inspection, repository file browsing, file history across renames, conflict inspection, and external editing. It does not provide hunk staging, branch switching, fetch/push, or an embedded merge editor. Repository changes are refreshed explicitly. Commit hooks and signing use your Git configuration; Git subprocesses do not have an interactive terminal.
 
 ```sh
 cargo test --offline
