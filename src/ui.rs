@@ -13,6 +13,7 @@ use crate::{
 };
 
 mod branches;
+mod tree;
 
 fn block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
     Block::default()
@@ -438,30 +439,21 @@ fn file_items(
     files: &[crate::git::File],
     rows: Vec<crate::tree::Row>,
     staged: Option<bool>,
+    width: u16,
 ) -> Vec<ListItem<'static>> {
     let mut items = Vec::new();
     for row in rows {
-        let mut spans = vec![Span::styled(
-            row.prefix.clone(),
-            Style::default().fg(BORDER),
-        )];
-        if row.directory {
+        let mut annotations = Vec::new();
+        let (marker, name) = if row.directory {
             let root = row.path.as_os_str().is_empty();
             let name = if root {
                 app.repo.root.file_name().unwrap_or_default()
             } else {
                 row.path.file_name().unwrap_or_default()
             };
-            spans.push(Span::styled(
-                format!(
-                    "{} {}/",
-                    if row.expanded { "▾" } else { "▸" },
-                    safe(&name.to_string_lossy())
-                ),
-                Style::default()
-                    .fg(if root { PURPLE } else { BLUE })
-                    .add_modifier(Modifier::BOLD),
-            ));
+            let style = Style::default()
+                .fg(if root { PURPLE } else { BLUE })
+                .add_modifier(Modifier::BOLD);
             if let Some(staged) = staged {
                 for status in [
                     "Added", "Modified", "Deleted", "Renamed", "Copied", "Conflict",
@@ -472,32 +464,47 @@ fn file_items(
                         .filter(|index| files[**index].status(staged) == status)
                         .count();
                     if count > 0 {
-                        spans.push(Span::styled(
+                        annotations.push(Span::styled(
                             format!(" {}{count}", change_symbol(status)),
                             Style::default().fg(change_color(status)),
                         ));
                     }
                 }
             }
+            (
+                Span::styled(if row.expanded { "▾ " } else { "▸ " }, style),
+                Span::styled(format!("{}/", safe(&name.to_string_lossy())), style),
+            )
         } else {
             let file = &files[row.files[0]];
-            let color = if let Some(staged) = staged {
+            let (marker, color) = if let Some(staged) = staged {
                 let status = file.status(staged);
                 let color = change_color(status);
-                spans.push(Span::styled(
-                    format!("{} ", change_symbol(status)),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                ));
-                color
+                (
+                    Span::styled(
+                        format!("{} ", change_symbol(status)),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    color,
+                )
             } else {
-                FG
+                (Span::raw(""), FG)
             };
-            spans.push(Span::styled(
-                safe(&file.path.file_name().unwrap_or_default().to_string_lossy()),
-                Style::default().fg(color),
-            ));
-        }
-        items.push(ListItem::new(Line::from(spans)));
+            (
+                marker,
+                Span::styled(
+                    safe(&file.path.file_name().unwrap_or_default().to_string_lossy()),
+                    Style::default().fg(color),
+                ),
+            )
+        };
+        items.push(ListItem::new(tree::fit_line(
+            &row.prefix,
+            marker,
+            name,
+            annotations,
+            usize::from(width),
+        )));
     }
     items
 }
@@ -511,7 +518,13 @@ fn render_changes(frame: &mut Frame, area: Rect, app: &mut App, tab: Tab) {
         .snapshot
         .as_ref()
         .map_or(&[][..], |snapshot| snapshot.files.as_slice());
-    let items = file_items(app, files, rows, Some(tab == Tab::Staged));
+    let items = file_items(
+        app,
+        files,
+        rows,
+        Some(tab == Tab::Staged),
+        area.width.saturating_sub(4),
+    );
     let (name, accent) = if tab == Tab::Changes {
         ("Changes", BLUE)
     } else {
@@ -573,7 +586,7 @@ fn render_repository_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let count = rows.first().map_or(0, |row| row.files.len());
     app.repository_selected = app.repository_selected.min(rows.len().saturating_sub(1));
     let files = app.repository_files();
-    let items = file_items(app, &files, rows, None);
+    let items = file_items(app, &files, rows, None, area.width.saturating_sub(4));
     app.repository_state.select(if items.is_empty() {
         None
     } else {
@@ -691,7 +704,13 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         } else {
             let files = app.files();
-            items = file_items(app, files, app.tree_rows(), Some(true));
+            items = file_items(
+                app,
+                files,
+                app.tree_rows(),
+                Some(true),
+                area.width.saturating_sub(4),
+            );
         }
     }
     let title = if app.filter.is_empty() {
