@@ -12,12 +12,15 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::widgets::ListState;
 
 use crate::{
+    branches::Browser,
     git::{
         self, Commit, CommitDetails, File, FileCommit, Preview, Repo, Request, Response, Selection,
         Snapshot, Stash, StashDetails,
     },
     input::Input,
 };
+
+mod branches;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -26,15 +29,17 @@ pub enum Tab {
     Log,
     Files,
     Stash,
+    Branches,
 }
 
 impl Tab {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Changes,
         Self::Staged,
         Self::Log,
         Self::Files,
         Self::Stash,
+        Self::Branches,
     ];
 }
 
@@ -105,12 +110,14 @@ pub struct App {
     pub page_height: usize,
     pub history: Option<History>,
     pub stash: Option<StashView>,
+    pub branches: Browser,
+    pub graphics: crate::graphics::Graphics,
     pub file_history: Option<FileHistory>,
     pub file_tree_focus: bool,
     pub repository_selected: usize,
     pub repository_filter: String,
     pub repository_state: ListState,
-    collapsed: [HashSet<PathBuf>; 5],
+    collapsed: [HashSet<PathBuf>; 6],
     history_generation: u64,
     sender: Sender<Request>,
     receiver: Receiver<Response>,
@@ -146,6 +153,8 @@ impl App {
             page_height: 10,
             history: None,
             stash: None,
+            branches: Browser::default(),
+            graphics: crate::graphics::Graphics::default(),
             file_history: None,
             file_tree_focus: false,
             repository_selected: 0,
@@ -170,7 +179,9 @@ impl App {
     }
 
     pub fn commit_list(&self) -> bool {
-        self.file_history.is_some() || (self.tab == Tab::Log && self.history.is_none())
+        self.file_history.is_some()
+            || (self.tab == Tab::Log && self.history.is_none())
+            || self.branch_graph_view()
     }
 
     pub fn commit_at(&self, index: usize) -> Option<&Commit> {
@@ -178,6 +189,13 @@ impl App {
             history
                 .entries
                 .as_ref()?
+                .get(index)
+                .map(|entry| &entry.commit)
+        } else if self.tab == Tab::Branches {
+            self.branches
+                .graph
+                .as_ref()?
+                .entries
                 .get(index)
                 .map(|entry| &entry.commit)
         } else {
@@ -188,6 +206,11 @@ impl App {
     fn commit_count(&self) -> usize {
         if let Some(history) = &self.file_history {
             history.entries.as_ref().map_or(0, Vec::len)
+        } else if self.tab == Tab::Branches {
+            self.branches
+                .graph
+                .as_ref()
+                .map_or(0, |graph| graph.entries.len())
         } else {
             self.snapshot
                 .as_ref()
@@ -233,6 +256,7 @@ impl App {
             Tab::Log => 2,
             Tab::Files => 3,
             Tab::Stash => 4,
+            Tab::Branches => 5,
         }
     }
 
@@ -300,6 +324,9 @@ impl App {
     }
 
     pub fn selection(&self) -> Option<Selection> {
+        if self.branch_list() {
+            return None;
+        }
         if self.stash_list() {
             let snapshot = self.snapshot.as_ref()?;
             return self
@@ -314,11 +341,10 @@ impl App {
             return self.file_history_selection();
         }
         if self.commit_list() {
-            let snapshot = self.snapshot.as_ref()?;
+            let index = *self.items().get(self.selected)?;
             return self
-                .items()
-                .get(self.selected)
-                .map(|i| Selection::Commit(snapshot.commits[*i].id.clone()));
+                .commit_at(index)
+                .map(|commit| Selection::Commit(commit.id.clone()));
         }
         let rows = self.tree_rows();
         let row = rows.get(self.selected)?;
@@ -384,6 +410,7 @@ impl App {
 
     pub fn tree_rows(&self) -> Vec<crate::tree::Row> {
         if self.commit_list()
+            || self.branch_list()
             || self.stash_list()
             || self
                 .stash
@@ -414,6 +441,10 @@ impl App {
         self.stash = None;
         self.file_history = None;
         self.tab = tab;
+        if tab == Tab::Branches {
+            self.branches = Browser::default();
+            self.restore_branch(None);
+        }
         self.file_tree_focus = tab == Tab::Files;
         if tab == Tab::Files {
             self.repository_selected = 0;
@@ -550,7 +581,9 @@ impl App {
     }
 
     fn current_filter(&self) -> &str {
-        if self.tab == Tab::Files && self.file_tree_focus {
+        if self.branch_list() {
+            &self.branches.filter
+        } else if self.tab == Tab::Files && self.file_tree_focus {
             &self.repository_filter
         } else {
             &self.filter
@@ -558,7 +591,16 @@ impl App {
     }
 
     fn update_filter(&mut self, filter: String) {
-        if self.tab == Tab::Files && self.file_tree_focus {
+        if self.branch_list() {
+            self.branches.filter = filter;
+            self.branches.selected = self
+                .branch_rows()
+                .iter()
+                .position(|row| matches!(row, crate::branches::Row::Branch(_)))
+                .unwrap_or(0);
+            self.branches.state = ListState::default();
+            self.sync_branches(false, false);
+        } else if self.tab == Tab::Files && self.file_tree_focus {
             self.repository_filter = filter;
             self.repository_selected = 0;
             if let Some(snapshot) = &self.snapshot {
@@ -740,9 +782,10 @@ impl App {
             return;
         };
         let Some(commit) = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.commits.iter().find(|c| c.id == id))
+            .items()
+            .into_iter()
+            .filter_map(|index| self.commit_at(index))
+            .find(|commit| commit.id == id)
             .cloned()
         else {
             return;
@@ -756,7 +799,7 @@ impl App {
             return_filter: std::mem::take(&mut self.filter),
             return_list_state: std::mem::take(&mut self.list_state),
         });
-        self.collapsed[2].clear();
+        self.collapsed[self.tree_index()].clear();
         self.selected = 0;
         self.list_focus = true;
         self.load_preview();
@@ -773,13 +816,13 @@ impl App {
                 .items()
                 .iter()
                 .position(|index| {
-                    self.snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.commits[*index].id == history.commit.id)
+                    self.commit_at(*index)
+                        .is_some_and(|commit| commit.id == history.commit.id)
                 })
                 .unwrap_or(history.return_selected);
             self.list_state = history.return_list_state;
             self.list_focus = true;
+            self.sync_branches(false, false);
             self.load_preview();
             self.notice("History · Enter opens commit files", false);
         }
@@ -849,6 +892,13 @@ impl App {
     }
 
     pub fn load_preview(&mut self) {
+        if self.branch_list() {
+            self.generation += 1;
+            self.preview = None;
+            self.preview_loading = false;
+            self.sync_branches(false, false);
+            return;
+        }
         if self.tab == Tab::Files && self.file_tree_focus {
             self.sync_repository_history();
             return;
@@ -903,6 +953,14 @@ impl App {
                     }
                     match result {
                         Ok(snapshot) => {
+                            let branch_before = self
+                                .selected_branch()
+                                .map(|branch| branch.reference.clone());
+                            let branch_group = self
+                                .branch_rows()
+                                .get(self.branches.selected)
+                                .copied()
+                                .filter(|row| !matches!(row, crate::branches::Row::Branch(_)));
                             let head_changed = self
                                 .snapshot
                                 .as_ref()
@@ -910,6 +968,26 @@ impl App {
                                 != snapshot.commits.first().map(|c| &c.id);
                             let previous = self.selection();
                             self.snapshot = Some(snapshot);
+                            if self.tab == Tab::Branches {
+                                if message.as_deref() == Some("Branch switched") {
+                                    self.branches.filter.clear();
+                                    self.branches.state = ListState::default();
+                                }
+                                self.restore_branch(
+                                    if message.as_deref() == Some("Branch switched") {
+                                        None
+                                    } else {
+                                        branch_before
+                                    },
+                                );
+                                if message.as_deref() != Some("Branch switched")
+                                    && let Some(group) = branch_group
+                                    && let Some(index) =
+                                        self.branch_rows().iter().position(|row| *row == group)
+                                {
+                                    self.branches.selected = index;
+                                }
+                            }
                             if let Some(stash) = &mut self.stash {
                                 stash.item.reference = self
                                     .snapshot
@@ -938,9 +1016,7 @@ impl App {
                                     }
                                     Selection::Commit(id) => {
                                         if let Some(position) = self.items().iter().position(|i| {
-                                            self.snapshot
-                                                .as_ref()
-                                                .is_some_and(|s| s.commits[*i].id == id)
+                                            self.commit_at(*i).is_some_and(|commit| commit.id == id)
                                         }) {
                                             if self.tab == Tab::Files && self.file_tree_focus {
                                                 self.repository_selected = position;
@@ -1008,6 +1084,7 @@ impl App {
                                 self.notice(message.unwrap_or_default(), false);
                                 self.load_preview();
                             }
+                            self.sync_branches(false, false);
                         }
                         Err(error) => {
                             self.committing = false;
@@ -1117,6 +1194,9 @@ impl App {
                         }
                     }
                 }
+                Response::BranchGraph(token, result) if self.branches.token == token => {
+                    self.apply_graph(result);
+                }
                 Response::Failed(error) => {
                     self.busy = false;
                     self.committing = false;
@@ -1143,6 +1223,10 @@ impl App {
     }
 
     fn reload_preview(&mut self) {
+        if self.branch_list() {
+            self.sync_branches(false, false);
+            return;
+        }
         if self.tab == Tab::Files && self.file_tree_focus {
             self.sync_repository_history();
             return;
@@ -1176,6 +1260,15 @@ impl App {
     }
 
     fn move_by(&mut self, amount: isize) {
+        if self.branch_list() {
+            self.branches.selected = self
+                .branches
+                .selected
+                .saturating_add_signed(amount)
+                .min(self.branch_rows().len().saturating_sub(1));
+            self.sync_branches(false, false);
+            return;
+        }
         if self.tab == Tab::Files && self.file_tree_focus {
             let next = self
                 .repository_selected
@@ -1196,6 +1289,7 @@ impl App {
                 self.selected = next;
                 self.load_preview();
             }
+            self.more_branches();
         } else {
             self.scroll = self
                 .scroll
@@ -1231,6 +1325,9 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
+        if self.tab == Tab::Branches && self.history.is_none() {
+            self.sync_branches(true, false);
+        }
         if let Some(view) = &self.file_history {
             if view.entries.is_some() {
                 let tree_focus = self.file_tree_focus;
@@ -1348,18 +1445,36 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('1' | '2' | '3' | '4' | '5') => {
+            KeyCode::Char('1' | '2' | '3' | '4' | '5' | '6') => {
                 let tab = match key.code {
                     KeyCode::Char('1') => Tab::Changes,
                     KeyCode::Char('2') => Tab::Staged,
                     KeyCode::Char('3') => Tab::Log,
                     KeyCode::Char('4') => Tab::Files,
-                    _ => Tab::Stash,
+                    KeyCode::Char('5') => Tab::Stash,
+                    _ => Tab::Branches,
                 };
                 self.switch_tab(tab);
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
+            KeyCode::Enter | KeyCode::Char('l' | ' ') | KeyCode::Right if self.branch_list() => {
+                self.branch_key(
+                    true,
+                    matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')),
+                );
+            }
+            KeyCode::Tab | KeyCode::BackTab if self.branch_list() => self.branch_key(true, false),
+            KeyCode::Char('h') | KeyCode::Left if self.branch_list() => {
+                self.branch_key(false, false)
+            }
+            KeyCode::Char('h') | KeyCode::Left if self.branch_graph_view() => {
+                if self.list_focus {
+                    self.leave_branches_graph();
+                } else {
+                    self.list_focus = true;
+                }
+            }
             KeyCode::Char('f' | 'F') => self.open_selected_file_history(),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right
                 if self.tab == Tab::Files && self.file_tree_focus =>
@@ -1409,7 +1524,10 @@ impl App {
             KeyCode::Enter => self.list_focus = false,
             KeyCode::Tab | KeyCode::BackTab => self.list_focus = !self.list_focus,
             KeyCode::Char('g') if was_g => {
-                if self.tab == Tab::Files && self.file_tree_focus {
+                if self.branch_list() {
+                    self.branches.selected = 0;
+                    self.sync_branches(false, false);
+                } else if self.tab == Tab::Files && self.file_tree_focus {
                     self.repository_selected = 0;
                     self.sync_repository_history();
                 } else if self.list_focus {
@@ -1422,12 +1540,16 @@ impl App {
             }
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char('G') => {
-                if self.tab == Tab::Files && self.file_tree_focus {
+                if self.branch_list() {
+                    self.branches.selected = self.branch_rows().len().saturating_sub(1);
+                    self.sync_branches(false, false);
+                } else if self.tab == Tab::Files && self.file_tree_focus {
                     self.repository_selected = self.repository_rows().len().saturating_sub(1);
                     self.sync_repository_history();
                 } else if self.list_focus {
                     self.selected = self.item_count().saturating_sub(1);
                     self.load_preview();
+                    self.more_branches();
                 } else {
                     self.scroll = self.max_scroll();
                 }
@@ -1478,14 +1600,21 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace if self.history.is_some() => {
                 self.leave_history();
             }
+            KeyCode::Esc | KeyCode::Backspace if self.branch_graph_view() => {
+                self.leave_branches_graph()
+            }
+            KeyCode::Esc | KeyCode::Backspace if self.branch_list() => {
+                self.update_filter(String::new())
+            }
             KeyCode::Esc => {
                 self.filter.clear();
                 self.list_focus = true;
                 self.load_preview();
             }
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('s') if self.branch_list() => self.switch_selected_branch(),
             KeyCode::Char('s' | 'u' | 'c' | 'e')
-                if matches!(self.tab, Tab::Log | Tab::Files | Tab::Stash) =>
+                if matches!(self.tab, Tab::Log | Tab::Files | Tab::Stash | Tab::Branches) =>
             {
                 self.notice("History is read-only", false);
             }

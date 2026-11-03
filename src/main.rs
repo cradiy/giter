@@ -1,6 +1,9 @@
 mod app;
+mod branches;
 mod conflict;
 mod git;
+mod graph;
+mod graphics;
 mod highlight;
 mod input;
 mod theme;
@@ -19,6 +22,7 @@ use clap::Parser;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste},
     execute,
+    terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
 
 use app::{Action, App};
@@ -33,6 +37,21 @@ struct Args {
 }
 
 struct TerminalGuard;
+
+struct SynchronizedFrame;
+
+impl SynchronizedFrame {
+    fn begin() -> io::Result<Self> {
+        execute!(io::stdout(), BeginSynchronizedUpdate)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for SynchronizedFrame {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), EndSynchronizedUpdate);
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -73,7 +92,11 @@ fn main() -> Result<()> {
         }
         dirty |= app.poll();
         if dirty {
+            let synchronized = SynchronizedFrame::begin()?;
+            app.graphics.hide(&mut io::stdout())?;
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            app.graphics.present(&mut io::stdout())?;
+            drop(synchronized);
             dirty = false;
         }
         if event::poll(Duration::from_millis(80))? {

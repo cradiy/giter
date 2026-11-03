@@ -104,6 +104,7 @@ pub struct Snapshot {
     pub committed_files: Vec<File>,
     pub commits: Vec<Commit>,
     pub stashes: Vec<Stash>,
+    pub branches: Vec<crate::branches::Branch>,
 }
 
 pub struct CommitDetails {
@@ -206,7 +207,7 @@ impl Repo {
         command
     }
 
-    fn run(&self, args: &[&OsStr]) -> Result<Vec<u8>> {
+    pub(crate) fn run(&self, args: &[&OsStr]) -> Result<Vec<u8>> {
         let output = self
             .command()
             .args(args)
@@ -220,7 +221,7 @@ impl Repo {
         Ok(output.stdout)
     }
 
-    fn strings(&self, args: &[&str]) -> Result<Vec<u8>> {
+    pub(crate) fn strings(&self, args: &[&str]) -> Result<Vec<u8>> {
         self.run(&args.iter().map(OsStr::new).collect::<Vec<_>>())
     }
 
@@ -313,6 +314,7 @@ impl Repo {
             committed_files,
             commits,
             stashes: self.stashes()?,
+            branches: self.branches()?,
         })
     }
 
@@ -971,13 +973,13 @@ fn stash_file_list(details: &StashDetails, files: &[File]) -> String {
 }
 
 #[cfg(unix)]
-fn os_string(bytes: &[u8]) -> OsString {
+pub(crate) fn os_string(bytes: &[u8]) -> OsString {
     use std::os::unix::ffi::OsStringExt;
     OsString::from_vec(bytes.to_vec())
 }
 
 #[cfg(not(unix))]
-fn os_string(bytes: &[u8]) -> OsString {
+pub(crate) fn os_string(bytes: &[u8]) -> OsString {
     OsString::from(String::from_utf8_lossy(bytes).as_ref())
 }
 
@@ -1088,6 +1090,8 @@ pub enum Request {
     CommitFiles(u64, String),
     FileHistory(u64, PathBuf, Option<String>),
     StashFiles(u64, String),
+    BranchGraph(u64, Vec<String>, usize),
+    SwitchBranch(String),
     Stage(Vec<File>),
     Unstage(Vec<File>),
     Commit(String),
@@ -1099,6 +1103,7 @@ pub enum Response {
     CommitFiles(u64, Result<CommitDetails, String>),
     FileHistory(u64, Result<Vec<FileCommit>, String>),
     StashFiles(u64, Result<Arc<StashDetails>, String>),
+    BranchGraph(u64, Result<crate::branches::Graph, String>),
     Failed(String),
 }
 
@@ -1108,9 +1113,9 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
     thread::spawn(move || {
         let mut pending = None;
         while let Some(mut request) = pending.take().or_else(|| receive.recv().ok()) {
-            if matches!(request, Request::Preview(..)) {
+            if matches!(request, Request::Preview(..) | Request::BranchGraph(..)) {
                 while let Ok(next) = receive.try_recv() {
-                    if matches!(next, Request::Preview(..)) {
+                    if std::mem::discriminant(&next) == std::mem::discriminant(&request) {
                         request = next;
                     } else {
                         pending = Some(next);
@@ -1145,11 +1150,19 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
                     token,
                     repo.stash_files(&id).map_err(|error| format!("{error:#}")),
                 ),
+                Request::BranchGraph(token, roots, limit) => Response::BranchGraph(
+                    token,
+                    repo.branch_graph(&roots, limit)
+                        .map_err(|error| format!("{error:#}")),
+                ),
                 request => {
                     let (result, message) = match request {
                         Request::Stage(files) => (repo.stage(&files), "Staged"),
                         Request::Unstage(files) => (repo.unstage(&files), "Unstaged"),
                         Request::Commit(message) => (repo.commit(&message), "Commit created"),
+                        Request::SwitchBranch(reference) => {
+                            (repo.switch_branch(&reference), "Branch switched")
+                        }
                         _ => unreachable!(),
                     };
                     match result {

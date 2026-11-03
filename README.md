@@ -10,7 +10,7 @@ Requires Git, an interactive terminal, and a working tree. The default path is t
 
 ## Workflow
 
-Use `1` for working-tree changes, `2` for staged changes, `3` for the latest 150 commits, `4` for committed repository files, and `5` for stashes. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
+Use `1` for working-tree changes, `2` for staged changes, `3` for the latest 150 commits, `4` for committed repository files, `5` for stashes, and `6` for branches. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
 
 Select a file to inspect its diff. Select a directory, including the root, to see its change summary. `s` / `u` stage / unstage all files listed under that directory, including collapsed descendants. With an active search, the scope includes only matching files; matching ancestors expand automatically. Directory staging checks all selected conflicts before updating the index. Git reads and writes run on a worker thread.
 
@@ -25,6 +25,18 @@ The Files tab has two columns: committed file tree on the left, the selected fil
 The tree is read from HEAD and lists committed files only, without working-tree or index statuses. Untracked files, staged additions, and uncommitted renames are excluded. `/` in the tree filters file paths. `f` also opens the selected file's history from Changes, Staged, or a historical commit's file tree.
 
 In the commit/change view, `j/k` select commits and immediately display their file patches. Enter, `l`, or Tab focuses the patch for scrolling; `h` returns to the commit list, and Esc returns to the file tree. `/` filters commit IDs, subjects, or authors; `r` reloads history. History follows Git-detected renames using each revision's filename, without the main History list's 150-commit cap. From a historical file it starts at the selected commit; otherwise it starts at HEAD. When opened from another tab, Esc from the file tree returns to that tab.
+
+## Branches
+
+Press `6` for the branch list and the selected branch's own commit history. Selecting another branch changes the displayed history; commits reachable only from HEAD are excluded. The summary shows how many commits the selected branch is ahead of or behind the current branch. Curves and commit nodes are antialiased images displayed through the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/); branch graphs require a terminal supporting that protocol. Commit text, navigation, and search remain terminal widgets. Images update with scrolling and resizing, and clear when leaving the graph or opening an input popup.
+
+Local and remote refs appear as labels on their commits; green `HEAD` labels identify the checked-out branch. Local branches appear first, with the current branch at the top. Remote branches start collapsed; `h/l`, Enter, or Space operates their group. `/` searches branch names and upstreams, including collapsed remote branches. Upstream indicators show `↑` ahead, `↓` behind, `=` synchronized, or `gone`; `[worktree]` marks branches occupied by another worktree. Remote information uses locally stored refs.
+
+Enter, `l`, or Tab moves the graph to the left and displays the selected commit's message and changed-file summary on the right. `j/k` selects commits; Enter or `l` opens that commit's file tree and individual patches. Esc returns from files to the graph, then from the graph to the branch list. `h` returns from the graph to branches; when the patch pane is focused it first returns focus to the graph. Returning preserves the selected commit, search, and list position.
+
+Graphs load in batches of 100 commits, extending as you approach the end. `G` moves to the end of the loaded history and requests the next batch when available; `+` beside the count indicates more commits. Graph search filters the loaded commits and shows isolated nodes while filtered. Clearing the search restores the full graph. Browsing keeps the working tree unchanged and historical contents pinned by commit ID. Files-tab history remains scoped to its selected file.
+
+Press `s` on a branch in the branch list to switch explicitly. A remote ref opens its matching local tracking branch, creating one when needed. Git checks for conflicting local changes and worktree occupancy. `s` does not switch branches while viewing commits or historical files. Branch refs and graphs refresh automatically after external changes; `r` also refreshes manually.
 
 ## Stashes
 
@@ -76,7 +88,7 @@ Configure the input method in your terminal emulator. The terminal handles IME p
 
 ## Scope
 
-This version supports file and directory staging/unstaging, commit creation, recent commit inspection, repository file browsing, file history across renames, conflict inspection, and external editing. It does not provide hunk staging, branch switching, fetch/push, or an embedded merge editor. Repository changes are refreshed explicitly. Commit hooks and signing use your Git configuration; Git subprocesses do not have an interactive terminal.
+This version supports file and directory staging/unstaging, commit creation, recent commit inspection, repository file browsing, file history across renames, conflict inspection, and external editing. It does not provide hunk staging, branch deletion, merge/rebase commands, fetch/push, or an embedded merge editor. Repository changes refresh automatically. Commit hooks and signing use your Git configuration; Git subprocesses do not have an interactive terminal.
 
 ```sh
 cargo test --offline

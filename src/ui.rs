@@ -12,6 +12,8 @@ use crate::{
     theme::*,
 };
 
+mod branches;
+
 fn block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
     Block::default()
         .title(title)
@@ -21,6 +23,7 @@ fn block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.graphics.scene = None;
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
     if area.width < 60 || area.height < 14 {
@@ -115,9 +118,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 s.commits.len(),
                 s.committed_files.len(),
                 s.stashes.len(),
+                s.branches.len(),
             ]
         })
-        .unwrap_or([0; 5]);
+        .unwrap_or([0; 6]);
     let mut tabs = Vec::new();
     for (i, (tab, name)) in [
         (Tab::Changes, "Changes"),
@@ -125,6 +129,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (Tab::Log, "History"),
         (Tab::Files, "Files"),
         (Tab::Stash, "Stash"),
+        (Tab::Branches, "Branches"),
     ]
     .into_iter()
     .enumerate()
@@ -135,9 +140,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Tab::Log => PURPLE,
             Tab::Files => CYAN,
             Tab::Stash => PEACH,
+            Tab::Branches => TEAL,
         };
         tabs.push(Span::styled(
-            if area.width < 85 {
+            if area.width < 75 {
+                let short = match tab {
+                    Tab::Changes => "Chg",
+                    Tab::Staged => "Stg",
+                    Tab::Log => "Log",
+                    Tab::Files => "Files",
+                    Tab::Stash => "Stash",
+                    Tab::Branches => "Br",
+                };
+                format!(" {} {short} ", i + 1)
+            } else if area.width < 103 {
                 format!(" {} {name} ", i + 1)
             } else {
                 format!(" {} {name} {} ", i + 1, counts[i])
@@ -163,7 +179,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
-    if app.tab == Tab::Files {
+    if app.tab == Tab::Branches && app.history.is_none() {
+        branches::draw(frame, rows[1], app);
+    } else if app.tab == Tab::Files {
         draw_files(frame, rows[1], app);
     } else {
         let sidebar = (area.width / 3).clamp(23, 42);
@@ -177,7 +195,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         render_list(frame, columns[0], app);
         render_preview(frame, columns[1], app);
     }
-    let hints = if app.tab == Tab::Files {
+    let hints = if app.branch_list() {
+        vec![
+            ("j/k", "branches", BLUE),
+            ("Enter/l", "history", TEAL),
+            ("s", "switch", GREEN),
+            ("/", "search", CYAN),
+            ("h/l", "groups", PURPLE),
+            ("?", "help", AMBER),
+        ]
+    } else if app.branch_graph_view() {
+        if app.list_focus {
+            vec![
+                ("j/k", "commits", BLUE),
+                ("Enter/l", "files", GREEN),
+                ("h/Esc", "branches", TEAL),
+                ("/", "search", CYAN),
+                ("?", "help", AMBER),
+            ]
+        } else {
+            vec![
+                ("j/k", "scroll", BLUE),
+                ("Tab/h", "commits", TEAL),
+                ("Esc", "branches", PURPLE),
+                ("H/L", "horizontal", PEACH),
+                ("?", "help", AMBER),
+            ]
+        }
+    } else if app.tab == Tab::Files {
         if app.file_tree_focus {
             let mut hints = vec![
                 ("j/k", "files", BLUE),
@@ -779,7 +824,8 @@ fn render_help(frame: &mut Frame) {
         Line::raw(" gg / G          First / last item or line"),
         Line::raw(" Ctrl+d / Ctrl+u Half page down / up"),
         Line::raw(" H / L           Scroll content horizontally"),
-        Line::raw(" 1 / 2 / 3 / 4 / 5  Changes / staged / history / files / stash"),
+        Line::raw(" 1..6            Changes / staged / history / files / stash / branches"),
+        Line::raw(" Branches        Enter: graph → files; s: switch selected branch"),
         Line::raw(" f               Show selected file history"),
         Line::raw(" /               Search current list (Unicode input)"),
         Line::raw(" r               Refresh repository and preview"),
