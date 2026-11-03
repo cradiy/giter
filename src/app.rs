@@ -97,6 +97,7 @@ pub struct App {
     pub preview: Option<Preview>,
     pub preview_loading: bool,
     pub list_focus: bool,
+    pub fullscreen: bool,
     pub scroll: usize,
     pub horizontal: u16,
     pub chunk: usize,
@@ -140,6 +141,7 @@ impl App {
             preview: None,
             preview_loading: false,
             list_focus: true,
+            fullscreen: false,
             scroll: 0,
             horizontal: 0,
             chunk: 0,
@@ -437,6 +439,7 @@ impl App {
     }
 
     fn switch_tab(&mut self, tab: Tab) {
+        self.fullscreen = false;
         self.history = None;
         self.stash = None;
         self.file_history = None;
@@ -657,6 +660,7 @@ impl App {
     }
 
     fn open_file_history(&mut self, path: PathBuf, query_path: PathBuf, start: Option<String>) {
+        self.fullscreen = false;
         let from_repository = self.tab == Tab::Files;
         if !from_repository {
             self.repository_filter.clear();
@@ -873,7 +877,7 @@ impl App {
             if row.directory && !row.files.is_empty() && self.selected + 1 < rows.len() {
                 self.selected += 1;
             } else if !row.directory {
-                self.list_focus = false;
+                self.open_fullscreen();
                 return;
             }
         } else if let Some(parent) = row.path.parent()
@@ -908,6 +912,10 @@ impl App {
     }
 
     fn request_preview(&mut self, selection: Option<Selection>) {
+        if self.fullscreen && !Self::file_preview(selection.as_ref()) {
+            self.fullscreen = false;
+            self.list_focus = true;
+        }
         self.generation += 1;
         self.preview = None;
         self.scroll = 0;
@@ -1232,6 +1240,12 @@ impl App {
             return;
         }
         self.selected = self.selected.min(self.item_count().saturating_sub(1));
+        if self.fullscreen && !Self::file_preview(self.selection().as_ref()) {
+            self.fullscreen = false;
+            self.list_focus = true;
+            self.load_preview();
+            return;
+        }
         if let Some(selection) = self.selection() {
             self.generation += 1;
             self.preview_loading = true;
@@ -1304,23 +1318,35 @@ impl App {
         };
         if let Some(conflict) = &preview.conflict {
             let start = conflict.chunks.get(self.chunk).map_or(0, |c| c.lines.start);
-            conflict
-                .working
-                .lines()
-                .count()
-                .saturating_sub(start)
-                .max(conflict.ours.lines().count())
-                .max(conflict.theirs.lines().count())
-                .max(conflict.base.lines().count())
-                .saturating_sub(1)
-                .min(u16::MAX as usize)
-        } else {
-            preview
-                .styled()
+            let styled = preview.styled();
+            let sources = styled
+                .sources
+                .as_ref()
+                .expect("Conflict sources are prepared");
+            styled
                 .lines
                 .len()
+                .saturating_sub(start)
+                .max(sources.ours.len())
+                .max(sources.theirs.len())
+                .max(sources.base.len())
                 .saturating_sub(1)
-                .min(u16::MAX as usize)
+        } else {
+            preview.styled().lines.len().saturating_sub(1)
+        }
+    }
+
+    fn file_preview(selection: Option<&Selection>) -> bool {
+        matches!(
+            selection,
+            Some(Selection::File(..) | Selection::CommitFile { .. } | Selection::StashFile { .. })
+        )
+    }
+
+    fn open_fullscreen(&mut self) {
+        if Self::file_preview(self.selection().as_ref()) {
+            self.fullscreen = true;
+            self.list_focus = false;
         }
     }
 
@@ -1445,6 +1471,18 @@ impl App {
         match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Esc
+            | KeyCode::Backspace
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('h')
+            | KeyCode::Left
+                if self.fullscreen =>
+            {
+                self.fullscreen = false;
+                self.list_focus = true;
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if self.fullscreen => {}
             KeyCode::Char('1' | '2' | '3' | '4' | '5' | '6') => {
                 let tab = match key.code {
                     KeyCode::Char('1') => Tab::Changes,
@@ -1482,7 +1520,7 @@ impl App {
                 self.repository_key(true, key.code == KeyCode::Enter)
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if self.tab == Tab::Files => {
-                self.list_focus = false
+                self.open_fullscreen()
             }
             KeyCode::Char('h') | KeyCode::Left if self.tab == Tab::Files => {
                 if self.file_tree_focus {
@@ -1497,7 +1535,7 @@ impl App {
                 if self.file_tree_focus {
                     self.enter_file_history();
                 } else {
-                    self.list_focus = !self.list_focus;
+                    self.open_fullscreen();
                 }
             }
             KeyCode::Char(' ') if self.tab == Tab::Files && self.file_tree_focus => {
@@ -1522,7 +1560,13 @@ impl App {
                 self.tree_key(true, true)
             }
             KeyCode::Enter => self.list_focus = false,
-            KeyCode::Tab | KeyCode::BackTab => self.list_focus = !self.list_focus,
+            KeyCode::Tab | KeyCode::BackTab => {
+                if self.list_focus && Self::file_preview(self.selection().as_ref()) {
+                    self.open_fullscreen();
+                } else {
+                    self.list_focus = !self.list_focus;
+                }
+            }
             KeyCode::Char('g') if was_g => {
                 if self.branch_list() {
                     self.branches.selected = 0;
@@ -1577,7 +1621,7 @@ impl App {
                 self.whole_sources = !self.whole_sources;
                 self.scroll = 0;
             }
-            KeyCode::Char('/') => {
+            KeyCode::Char('/') if !self.fullscreen => {
                 let mut input = Input::default();
                 input.insert(self.current_filter(), false);
                 self.mode = Mode::Search(input);

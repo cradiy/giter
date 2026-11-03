@@ -12,7 +12,7 @@ Requires Git, an interactive terminal, and a working tree. The default path is t
 
 Use `1` for working-tree changes, `2` for staged changes, `3` for the latest 150 commits, `4` for committed repository files, `5` for stashes, and `6` for branches. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
 
-Select a file to inspect its diff. Select a directory, including the root, to see its change summary. `s` / `u` stage / unstage all files listed under that directory, including collapsed descendants. With an active search, the scope includes only matching files; matching ancestors expand automatically. Directory staging checks all selected conflicts before updating the index. Git reads and writes run on a worker thread.
+Select a file to preview its diff. Enter, `l`, or Tab opens the file in a full-screen diff view. Esc, `h`, or Tab returns to the same file list, preserving selection, filters, and preview scroll. Full-screen diffs hide tabs and the repository bar, retaining the file title and navigation shortcuts. Historical and stash files use the same view. Select a directory, including the root, to see its change summary. `s` / `u` stage / unstage all files listed under that directory, including collapsed descendants. With an active search, the scope includes only matching files; matching ancestors expand automatically. Directory staging checks all selected conflicts before updating the index. Git reads and writes run on a worker thread.
 
 Filesystem notifications refresh working files, the index, branches, history, and stashes after external changes. Batches use a 180 ms quiet period and a one-second debounce limit. Watching respects Git ignore rules, includes tracked paths inside ignored directories, and supports linked worktrees and shared Git refs. Git object storage is excluded. Automatic refresh preserves selection, searches, and preview scroll; refresh waits while a search or commit message is being entered. Historical commit and stash contents remain pinned. Press `r` for a manual refresh.
 
@@ -24,7 +24,7 @@ The Files tab has two columns: committed file tree on the left, the selected fil
 
 The tree is read from HEAD and lists committed files only, without working-tree or index statuses. Untracked files, staged additions, and uncommitted renames are excluded. `/` in the tree filters file paths. `f` also opens the selected file's history from Changes, Staged, or a historical commit's file tree.
 
-In the commit/change view, `j/k` select commits and immediately display their file patches. Enter, `l`, or Tab focuses the patch for scrolling; `h` returns to the commit list, and Esc returns to the file tree. `/` filters commit IDs, subjects, or authors; `r` reloads history. History follows Git-detected renames using each revision's filename, without the main History list's 150-commit cap. From a historical file it starts at the selected commit; otherwise it starts at HEAD. When opened from another tab, Esc from the file tree returns to that tab.
+In the commit/change view, `j/k` select commits and immediately display their file patches. Enter, `l`, or Tab opens the full-screen patch. Esc, `h`, or Tab returns to the commit list; Esc from that list returns to the file tree. `/` filters commit IDs, subjects, or authors; `r` reloads history. History follows Git-detected renames using each revision's filename, without the main History list's 150-commit cap. From a historical file it starts at the selected commit; otherwise it starts at HEAD. When opened from another tab, Esc from the file tree returns to that tab.
 
 ## Branches
 
@@ -47,9 +47,9 @@ Stash previews include saved working-tree changes, the saved index, and untracke
 | Key | Action |
 | --- | --- |
 | `j/k`, arrows | Move through files or scroll the preview |
-| `h/l` | Collapse / expand directory; move to parent / enter child; `l` on a file focuses preview |
-| Enter / Space | Toggle selected directory; Enter on a file opens preview |
-| `Tab` | Switch focus between tree and preview |
+| `h/l` | Collapse / expand directory; move to parent / enter child; `l` on a file opens full-screen diff |
+| Enter / Space | Toggle selected directory; Enter on a file opens full-screen diff |
+| `Tab` | Open a selected file diff; return from full-screen diff; otherwise switch pane focus |
 | `Ctrl+h/l` | Previous / next tab, wrapping around |
 | Enter / `l` on a commit or stash | Open its changed-file tree |
 | Esc / Backspace in commit or stash files | Return to its list |

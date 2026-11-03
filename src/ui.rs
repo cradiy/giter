@@ -34,6 +34,58 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         return;
     }
+    if app.fullscreen {
+        let rows = Layout::vertical([
+            Constraint::Min(4),
+            Constraint::Length(u16::from(app.error)),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        app.page_height = rows[0].height.saturating_sub(2) as usize;
+        render_preview(frame, rows[0], app);
+        if app.error {
+            frame.render_widget(
+                Paragraph::new(safe(&app.message)).style(Style::default().fg(RED)),
+                rows[1],
+            );
+        }
+        let mut hints = vec![
+            Span::styled(" Esc/h/Tab ", Style::default().fg(PURPLE)),
+            Span::raw("back  "),
+            Span::styled("j/k Ctrl+d/u ", Style::default().fg(BLUE)),
+            Span::raw("scroll  "),
+            Span::styled("gg/G ", Style::default().fg(TEAL)),
+            Span::raw("top/end  "),
+            Span::styled("H/L ", Style::default().fg(PEACH)),
+            Span::raw("horizontal  "),
+        ];
+        if matches!(app.tab, Tab::Changes | Tab::Staged) {
+            hints.extend([
+                Span::styled("s/u ", Style::default().fg(GREEN)),
+                Span::raw("stage/unstage  "),
+            ]);
+        }
+        if app
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.conflict.is_some())
+        {
+            hints.extend([
+                Span::styled("[/] v b e ", Style::default().fg(AMBER)),
+                Span::raw("conflicts  "),
+            ]);
+        }
+        hints.extend([
+            Span::styled("? ", Style::default().fg(AMBER)),
+            Span::raw("help"),
+        ]);
+        frame.render_widget(
+            Paragraph::new(Line::from(hints)).style(Style::default().fg(MUTED).bg(PANEL)),
+            rows[2],
+        );
+        render_mode(frame, app);
+        return;
+    }
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(4),
@@ -328,6 +380,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Paragraph::new(hints).style(Style::default().bg(PANEL).fg(MUTED)),
         rows[3],
     );
+    render_mode(frame, app);
+}
+
+fn render_mode(frame: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Help => render_help(frame),
         Mode::Commit(input) => {
@@ -732,18 +788,23 @@ fn render_preview(frame: &mut Frame, area: Rect, app: &App) {
             lines.len()
         );
         frame.render_widget(
-            Paragraph::new(lines.clone())
+            visible_lines(lines, offset, rows[2].height.saturating_sub(2))
                 .block(block(title, !app.list_focus))
-                .scroll((offset.min(u16::MAX as usize) as u16, app.horizontal)),
+                .scroll((0, app.horizontal)),
             rows[2],
         );
     } else {
         let lines = &preview.styled().lines;
-        let title = format!(" {} · {} lines ", safe(&preview.title), lines.len());
+        let title = format!(
+            " {}{} · {} lines ",
+            if app.fullscreen { "Diff · " } else { "" },
+            safe(&preview.title),
+            lines.len()
+        );
         frame.render_widget(
-            Paragraph::new(lines.clone())
+            visible_lines(lines, app.scroll, area.height.saturating_sub(2))
                 .block(block(title, !app.list_focus))
-                .scroll((app.scroll as u16, app.horizontal)),
+                .scroll((0, app.horizontal)),
             area,
         );
     }
@@ -758,14 +819,20 @@ fn source(
     app: &App,
 ) {
     frame.render_widget(
-        Paragraph::new(lines.to_vec())
+        visible_lines(lines, app.scroll, area.height.saturating_sub(2))
             .block(block(
                 Line::styled(title, Style::default().fg(color)),
                 !app.list_focus,
             ))
-            .scroll((app.scroll as u16, app.horizontal)),
+            .scroll((0, app.horizontal)),
         area,
     );
+}
+
+fn visible_lines(lines: &[Line<'static>], offset: usize, height: u16) -> Paragraph<'static> {
+    let start = offset.min(lines.len());
+    let end = start.saturating_add(usize::from(height)).min(lines.len());
+    Paragraph::new(lines[start..end].to_vec())
 }
 
 fn popup(area: Rect, width: u16, height: u16) -> Rect {
@@ -872,6 +939,63 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn fullscreen_preview_renders_only_the_visible_window_beyond_u16_offsets() {
+        let mut app = App::new(Repo {
+            root: "/nonexistent-giter-fullscreen-test".into(),
+        });
+        let styles = std::sync::OnceLock::new();
+        let lines = (0..70010)
+            .map(|index| {
+                Line::styled(
+                    format!(
+                        "row{index}-{}",
+                        if index == 65536 {
+                            "x".repeat(150)
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    Style::default().fg(RED),
+                )
+            })
+            .collect();
+        let _ = styles.set(Box::new(crate::highlight::StyledPreview {
+            lines,
+            sources: None,
+            chunks: vec![],
+        }));
+        app.preview = Some(Preview {
+            title: "large.rs".into(),
+            text: String::new(),
+            conflict: None,
+            code_path: None,
+            styles,
+        });
+        app.list_focus = false;
+        app.fullscreen = true;
+        app.scroll = 65536;
+        let mut terminal = Terminal::new(TestBackend::new(180, 20)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row: String = (1..179).map(|x| buffer[(x, 1)].symbol()).collect();
+        assert!(row.starts_with("row65536-"));
+        assert_eq!(buffer[(100, 1)].symbol(), "x");
+        assert_eq!(buffer[(100, 1)].fg, RED);
+        assert_eq!(app.page_height, 17);
+        app.horizontal = 3;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "6");
+        app.horizontal = 0;
+        app.scroll = 70009;
+        let mut narrow = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut app)).unwrap();
+        let last: String = (1..79)
+            .map(|x| narrow.backend().buffer()[(x, 1)].symbol())
+            .collect();
+        assert!(last.starts_with("row70009-"));
+    }
 
     #[test]
     fn renders_conflict_sides_and_places_cjk_input_cursor() {
