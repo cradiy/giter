@@ -10,7 +10,7 @@ Requires Git, an interactive terminal, and a working tree. The default path is t
 
 ## Workflow
 
-Use `1` for working-tree changes, `2` for staged changes, `3` for the latest 150 commits, `4` for committed repository files, `5` for stashes, and `6` for branches. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
+Use `1` for changes, `2` for the latest 150 commits, `3` for committed repository files, `4` for stashes, and `5` for branches. The Changes view shows unstaged files in the upper-left tree and staged files in the lower-left tree, with a shared diff preview on the right. `Ctrl+j` focuses Staged and `Ctrl+k` focuses Changes. Moving down past the last Changes row or up past the first Staged row with `j/k` or the arrow keys crosses to the adjacent tree. Each tree retains its own selection, search, collapsed directories, and scroll position. `Ctrl+h` / `Ctrl+l` cycle to the previous / next tab. Changes, Staged, and commit file trees show colored status letters: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, and `U` conflicted. Added files, including untracked files, appear in green. The Files tree shows committed filenames without status letters or change counts. Other trees summarize changed statuses with counts. Conflict entries and directories containing conflicts sort first.
 
 Select a file to preview its diff. Enter, `l`, or Tab opens the file in a full-screen diff view. Esc, `h`, or Tab returns to the same file list, preserving selection, filters, and preview scroll. Full-screen diffs hide tabs and the repository bar, retaining the file title and navigation shortcuts. Historical and stash files use the same view. Select a directory, including the root, to see its change summary. `s` / `u` stage / unstage all files listed under that directory, including collapsed descendants. With an active search, the scope includes only matching files; matching ancestors expand automatically. Directory staging checks all selected conflicts before updating the index. Git reads and writes run on a worker thread.
 
@@ -51,6 +51,8 @@ Stash previews include saved working-tree changes, the saved index, and untracke
 | Enter / Space | Toggle selected directory; Enter on a file opens full-screen diff |
 | `Tab` | Open a selected file diff; return from full-screen diff; otherwise switch pane focus |
 | `Ctrl+h/l` | Previous / next tab, wrapping around |
+| `Ctrl+j/k` | Focus Staged / Changes in the combined Changes view |
+| `j/k`, up/down at adjacent tree edges | Move between Changes and Staged |
 | Enter / `l` on a commit or stash | Open its changed-file tree |
 | Esc / Backspace in commit or stash files | Return to its list |
 | Enter / `l` on a file in Files | Move to the commit list and file changes |

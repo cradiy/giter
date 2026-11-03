@@ -359,7 +359,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
-    fn selected_graph_ref_badges_keep_their_colors_and_six_tabs_fit_minimum_width() {
+    fn selected_graph_ref_badges_keep_their_colors_and_five_tabs_fit_minimum_width() {
         let mut app = App::new(Repo {
             root: "/nonexistent-giter-ui-test".into(),
         });
@@ -424,6 +424,6 @@ mod tests {
         let tabs: String = (0..60)
             .map(|x| narrow.backend().buffer()[(x, 0)].symbol())
             .collect();
-        assert!(tabs.contains("1 Chg") && tabs.contains("6 Br"));
+        assert!(tabs.contains("1 Chg") && tabs.contains("5 Br"));
     }
 }

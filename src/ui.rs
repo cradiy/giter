@@ -165,19 +165,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let counts = snapshot
         .map(|s| {
             [
-                s.files.iter().filter(|f| f.unstaged()).count(),
-                s.files.iter().filter(|f| f.staged()).count(),
+                s.files.len(),
                 s.commits.len(),
                 s.committed_files.len(),
                 s.stashes.len(),
                 s.branches.len(),
             ]
         })
-        .unwrap_or([0; 6]);
+        .unwrap_or([0; 5]);
     let mut tabs = Vec::new();
     for (i, (tab, name)) in [
         (Tab::Changes, "Changes"),
-        (Tab::Staged, "Staged"),
         (Tab::Log, "History"),
         (Tab::Files, "Files"),
         (Tab::Stash, "Stash"),
@@ -211,9 +209,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 format!(" {} {name} {} ", i + 1, counts[i])
             },
             Style::default()
-                .fg(if app.tab == tab { BG } else { accent })
-                .bg(if app.tab == tab { accent } else { PANEL })
-                .add_modifier(if app.tab == tab {
+                .fg(if app.main_tab() == tab { BG } else { accent })
+                .bg(if app.main_tab() == tab { accent } else { PANEL })
+                .add_modifier(if app.main_tab() == tab {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
@@ -244,7 +242,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else {
             columns[1].height.saturating_sub(2) as usize
         };
-        render_list(frame, columns[0], app);
+        if app.changes_view() {
+            let panes = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(columns[0]);
+            if app.list_focus {
+                app.page_height = panes[usize::from(app.tab == Tab::Staged)]
+                    .height
+                    .saturating_sub(2) as usize;
+            }
+            render_changes(frame, panes[0], app, Tab::Changes);
+            render_changes(frame, panes[1], app, Tab::Staged);
+        } else {
+            render_list(frame, columns[0], app);
+        }
         render_preview(frame, columns[1], app);
     }
     let hints = if app.branch_list() {
@@ -341,6 +351,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]
     } else if app.preview.as_ref().is_some_and(|p| p.conflict.is_some()) {
         vec![
+            ("Ctrl+j/k", "lists", TEAL),
             ("hjkl", "move", BLUE),
             ("[ ]", "conflict", AMBER),
             ("b", "base", PURPLE),
@@ -351,6 +362,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]
     } else {
         vec![
+            ("Ctrl+j/k", "lists", TEAL),
             ("hjkl", "move", BLUE),
             ("f", "history", CYAN),
             ("s", "stage", GREEN),
@@ -425,6 +437,7 @@ fn file_items(
     app: &App,
     files: &[crate::git::File],
     rows: Vec<crate::tree::Row>,
+    staged: Option<bool>,
 ) -> Vec<ListItem<'static>> {
     let mut items = Vec::new();
     for row in rows {
@@ -449,14 +462,14 @@ fn file_items(
                     .fg(if root { PURPLE } else { BLUE })
                     .add_modifier(Modifier::BOLD),
             ));
-            if app.tab != Tab::Files {
+            if let Some(staged) = staged {
                 for status in [
                     "Added", "Modified", "Deleted", "Renamed", "Copied", "Conflict",
                 ] {
                     let count = row
                         .files
                         .iter()
-                        .filter(|index| app.file_status(&files[**index]) == status)
+                        .filter(|index| files[**index].status(staged) == status)
                         .count();
                     if count > 0 {
                         spans.push(Span::styled(
@@ -468,16 +481,16 @@ fn file_items(
             }
         } else {
             let file = &files[row.files[0]];
-            let color = if app.tab == Tab::Files {
-                FG
-            } else {
-                let status = app.file_status(file);
+            let color = if let Some(staged) = staged {
+                let status = file.status(staged);
                 let color = change_color(status);
                 spans.push(Span::styled(
                     format!("{} ", change_symbol(status)),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ));
                 color
+            } else {
+                FG
             };
             spans.push(Span::styled(
                 safe(&file.path.file_name().unwrap_or_default().to_string_lossy()),
@@ -489,12 +502,78 @@ fn file_items(
     items
 }
 
+fn render_changes(frame: &mut Frame, area: Rect, app: &mut App, tab: Tab) {
+    let active = app.tab == tab;
+    let focused = active && app.list_focus;
+    let rows = app.change_rows(tab);
+    let count = rows.first().map_or(0, |row| row.files.len());
+    let files = app
+        .snapshot
+        .as_ref()
+        .map_or(&[][..], |snapshot| snapshot.files.as_slice());
+    let items = file_items(app, files, rows, Some(tab == Tab::Staged));
+    let (name, accent) = if tab == Tab::Changes {
+        ("Changes", BLUE)
+    } else {
+        ("Staged", GREEN)
+    };
+    let filter = app.change_filter(tab);
+    let title = if filter.is_empty() {
+        format!(" {name} · {count} ")
+    } else {
+        format!(" {name} · {count} / {} ", safe(filter))
+    };
+    let empty = items.is_empty();
+    let filtered = !filter.is_empty();
+    let state = if active {
+        app.selected = app.selected.min(items.len().saturating_sub(1));
+        app.list_state.select((!empty).then_some(app.selected));
+        &mut app.list_state
+    } else {
+        let pane = &mut app.change_panes[usize::from(tab == Tab::Staged)];
+        pane.selected = pane.selected.min(items.len().saturating_sub(1));
+        pane.list_state.select((!empty).then_some(pane.selected));
+        &mut pane.list_state
+    };
+    let border = block(title, focused)
+        .title_style(Style::default().fg(accent))
+        .border_style(Style::default().fg(if focused { accent } else { BORDER }));
+    let inner = border.inner(area);
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(border)
+            .highlight_style(if focused {
+                Style::default()
+                    .bg(Color::Rgb(49, 50, 74))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+            .highlight_symbol(if focused { "› " } else { "  " }),
+        area,
+        state,
+    );
+    if empty {
+        frame.render_widget(
+            Paragraph::new(if filtered {
+                "No matches"
+            } else if tab == Tab::Changes {
+                "No unstaged changes"
+            } else {
+                "No staged changes"
+            })
+            .style(Style::default().fg(MUTED)),
+            inner,
+        );
+    }
+}
+
 fn render_repository_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let rows = app.repository_rows();
     let count = rows.first().map_or(0, |row| row.files.len());
     app.repository_selected = app.repository_selected.min(rows.len().saturating_sub(1));
     let files = app.repository_files();
-    let items = file_items(app, &files, rows);
+    let items = file_items(app, &files, rows, None);
     app.repository_state.select(if items.is_empty() {
         None
     } else {
@@ -612,7 +691,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         } else {
             let files = app.files();
-            items = file_items(app, files, app.tree_rows());
+            items = file_items(app, files, app.tree_rows(), Some(true));
         }
     }
     let title = if app.filter.is_empty() {
@@ -876,7 +955,7 @@ fn render_input(frame: &mut Frame, input: &Input, title: &'static str, multiline
 }
 
 fn render_help(frame: &mut Frame) {
-    let area = popup(frame.area(), 84, 35);
+    let area = popup(frame.area(), 84, 36);
     frame.render_widget(Clear, area);
     let text = vec![
         Line::styled(
@@ -885,19 +964,21 @@ fn render_help(frame: &mut Frame) {
         ),
         Line::raw(" j/k             Move selection or scroll preview"),
         Line::raw(" h/l             Collapse / expand; h parent, l enter"),
-        Line::raw(" Enter / Space   Toggle directory; Enter file preview"),
+        Line::raw(" Enter / Space   Toggle directory; Enter full-screen file diff"),
         Line::raw(" Ctrl+h / Ctrl+l Previous / next tab"),
-        Line::raw(" Tab             Switch visible pane; open file history"),
+        Line::raw(" Ctrl+j / Ctrl+k Focus staged / changes list"),
+        Line::raw(" j/k / arrows    Cross changes/staged at adjacent list edges"),
+        Line::raw(" Tab             Open / leave full-screen diff; enter file history"),
         Line::raw(" gg / G          First / last item or line"),
         Line::raw(" Ctrl+d / Ctrl+u Half page down / up"),
         Line::raw(" H / L           Scroll content horizontally"),
-        Line::raw(" 1..6            Changes / staged / history / files / stash / branches"),
+        Line::raw(" 1..5            Changes / history / files / stash / branches"),
         Line::raw(" Branches        Enter: graph → files; s: switch selected branch"),
         Line::raw(" f               Show selected file history"),
         Line::raw(" /               Search current list (Unicode input)"),
         Line::raw(" r               Refresh repository and preview"),
         Line::raw(" Enter / l       Open selected commit or stash file tree"),
-        Line::raw(" Esc / Backspace Return from commit / stash files to list"),
+        Line::raw(" Esc / Backspace Return from full-screen diff / commit / stash files"),
         Line::raw(" History files are read-only; merge diff uses first parent."),
         Line::raw(""),
         Line::styled(

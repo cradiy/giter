@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod branches;
+mod changes;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -33,14 +34,20 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Changes,
-        Self::Staged,
         Self::Log,
         Self::Files,
         Self::Stash,
         Self::Branches,
     ];
+}
+
+#[derive(Default)]
+pub struct ChangeState {
+    pub selected: usize,
+    pub filter: String,
+    pub list_state: ListState,
 }
 
 pub enum Mode {
@@ -118,6 +125,8 @@ pub struct App {
     pub repository_selected: usize,
     pub repository_filter: String,
     pub repository_state: ListState,
+    pub change_panes: [ChangeState; 2],
+    change_tab: Tab,
     collapsed: [HashSet<PathBuf>; 6],
     history_generation: u64,
     sender: Sender<Request>,
@@ -162,6 +171,8 @@ impl App {
             repository_selected: 0,
             repository_filter: String::new(),
             repository_state: ListState::default(),
+            change_panes: std::array::from_fn(|_| ChangeState::default()),
+            change_tab: Tab::Changes,
             collapsed: std::array::from_fn(|_| HashSet::new()),
             history_generation: 0,
             sender,
@@ -241,14 +252,6 @@ impl App {
                 }
             })
         }
-    }
-
-    pub fn file_status(&self, file: &File) -> &'static str {
-        file.status(if self.tab == Tab::Files {
-            file.worktree == ' '
-        } else {
-            self.tab != Tab::Changes
-        })
     }
 
     fn tree_index(&self) -> usize {
@@ -411,6 +414,9 @@ impl App {
     }
 
     pub fn tree_rows(&self) -> Vec<crate::tree::Row> {
+        if self.changes_view() {
+            return self.change_rows(self.tab);
+        }
         if self.commit_list()
             || self.branch_list()
             || self.stash_list()
@@ -439,6 +445,12 @@ impl App {
     }
 
     fn switch_tab(&mut self, tab: Tab) {
+        self.save_change_state();
+        let tab = if tab == Tab::Changes {
+            self.change_tab
+        } else {
+            tab
+        };
         self.fullscreen = false;
         self.history = None;
         self.stash = None;
@@ -458,6 +470,9 @@ impl App {
         self.filter.clear();
         self.list_focus = true;
         self.list_state = ListState::default();
+        if self.changes_view() {
+            self.restore_change_state();
+        }
         self.load_preview();
     }
 
@@ -660,6 +675,7 @@ impl App {
     }
 
     fn open_file_history(&mut self, path: PathBuf, query_path: PathBuf, start: Option<String>) {
+        self.save_change_state();
         self.fullscreen = false;
         let from_repository = self.tab == Tab::Files;
         if !from_repository {
@@ -975,7 +991,40 @@ impl App {
                                 .and_then(|s| s.commits.first().map(|c| &c.id))
                                 != snapshot.commits.first().map(|c| &c.id);
                             let previous = self.selection();
+                            let change_anchors: Vec<_> = [Tab::Changes, Tab::Staged]
+                                .into_iter()
+                                .filter(|tab| *tab != self.tab)
+                                .map(|tab| {
+                                    let selected =
+                                        self.change_panes[usize::from(tab == Tab::Staged)].selected;
+                                    let anchor = self
+                                        .change_rows(tab)
+                                        .get(selected)
+                                        .map(|row| (row.path.clone(), row.directory));
+                                    (tab, anchor)
+                                })
+                                .collect();
                             self.snapshot = Some(snapshot);
+                            for (tab, anchor) in change_anchors {
+                                let rows = self.change_rows(tab);
+                                let state = &mut self.change_panes[usize::from(tab == Tab::Staged)];
+                                state.selected = anchor
+                                    .and_then(|(path, directory)| {
+                                        rows.iter()
+                                            .position(|row| {
+                                                row.path == path && row.directory == directory
+                                            })
+                                            .or_else(|| {
+                                                path.ancestors().skip(1).find_map(|parent| {
+                                                    rows.iter().position(|row| {
+                                                        row.directory && row.path == parent
+                                                    })
+                                                })
+                                            })
+                                    })
+                                    .unwrap_or(state.selected)
+                                    .min(rows.len().saturating_sub(1));
+                            }
                             if self.tab == Tab::Branches {
                                 if message.as_deref() == Some("Branch switched") {
                                     self.branches.filter.clear();
@@ -1453,7 +1502,7 @@ impl App {
                 KeyCode::Char('l' | 'h') => {
                     let index = Tab::ALL
                         .iter()
-                        .position(|tab| *tab == self.tab)
+                        .position(|tab| *tab == self.main_tab())
                         .unwrap_or(0);
                     let offset = if key.code == KeyCode::Char('l') {
                         1
@@ -1464,6 +1513,8 @@ impl App {
                 }
                 KeyCode::Char('d') => self.move_by((self.page_height / 2).max(1) as isize),
                 KeyCode::Char('u') => self.move_by(-((self.page_height / 2).max(1) as isize)),
+                KeyCode::Char('j') => self.focus_changes(Tab::Staged, false),
+                KeyCode::Char('k') => self.focus_changes(Tab::Changes, false),
                 _ => {}
             }
             return Action::None;
@@ -1483,19 +1534,18 @@ impl App {
                 self.list_focus = true;
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if self.fullscreen => {}
-            KeyCode::Char('1' | '2' | '3' | '4' | '5' | '6') => {
+            KeyCode::Char('1' | '2' | '3' | '4' | '5') => {
                 let tab = match key.code {
                     KeyCode::Char('1') => Tab::Changes,
-                    KeyCode::Char('2') => Tab::Staged,
-                    KeyCode::Char('3') => Tab::Log,
-                    KeyCode::Char('4') => Tab::Files,
-                    KeyCode::Char('5') => Tab::Stash,
+                    KeyCode::Char('2') => Tab::Log,
+                    KeyCode::Char('3') => Tab::Files,
+                    KeyCode::Char('4') => Tab::Stash,
                     _ => Tab::Branches,
                 };
                 self.switch_tab(tab);
             }
-            KeyCode::Char('j') | KeyCode::Down => self.move_by(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_by(-1),
+            KeyCode::Char('j') | KeyCode::Down => self.move_step(1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_step(-1),
             KeyCode::Enter | KeyCode::Char('l' | ' ') | KeyCode::Right if self.branch_list() => {
                 self.branch_key(
                     true,
