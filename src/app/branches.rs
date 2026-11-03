@@ -54,10 +54,10 @@ impl App {
         };
         let snapshot = self.snapshot.as_ref().unwrap();
         let mut roots = vec![branch.tip.clone()];
-        if let Some(head) = snapshot.commits.first()
-            && !roots.contains(&head.id)
+        if let Some(head) = &snapshot.head
+            && !roots.contains(head)
         {
-            roots.push(head.id.clone());
+            roots.push(head.clone());
         }
         let same = self.branches.reference.as_deref() == Some(&branch.reference);
         if !force

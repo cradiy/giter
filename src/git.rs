@@ -102,7 +102,7 @@ pub struct Snapshot {
     pub operation: String,
     pub files: Vec<File>,
     pub committed_files: Vec<File>,
-    pub commits: Vec<Commit>,
+    pub head: Option<String>,
     pub stashes: Vec<Stash>,
     pub branches: Vec<crate::branches::Branch>,
 }
@@ -255,7 +255,11 @@ impl Repo {
         let status = self.strings(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
         let mut files = parse_status(&status)?;
         files.sort_by_key(|f| (!f.conflicted(), f.path.clone()));
-        let has_head = self.head_exists();
+        let head = self
+            .strings(&["rev-parse", "--verify", "-q", "HEAD"])
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned());
+        let has_head = head.is_some();
         let committed_files = if has_head {
             self.strings(&["ls-tree", "-r", "--name-only", "-z", "HEAD"])?
                 .split(|byte| *byte == 0)
@@ -294,25 +298,12 @@ impl Repo {
                 break;
             }
         }
-        let mut commits = Vec::new();
-        if has_head {
-            let log = self.strings(&["log", "-150", "-z", "--format=%H%x00%s%x00%an%x00%ar"])?;
-            let fields: Vec<_> = log.split(|b| *b == 0).collect();
-            for fields in fields.as_chunks::<4>().0 {
-                commits.push(Commit {
-                    id: String::from_utf8_lossy(fields[0]).into(),
-                    subject: String::from_utf8_lossy(fields[1]).into(),
-                    author: String::from_utf8_lossy(fields[2]).into(),
-                    age: String::from_utf8_lossy(fields[3]).into(),
-                });
-            }
-        }
         Ok(Snapshot {
             branch,
             operation,
             files,
             committed_files,
-            commits,
+            head,
             stashes: self.stashes()?,
             branches: self.branches()?,
         })
@@ -1220,10 +1211,14 @@ mod tests {
         fs::write(&path, "ours\n").unwrap();
         repo.strings(&["add", "."]).unwrap();
         repo.commit("current").unwrap();
+        let current = String::from_utf8(repo.strings(&["rev-parse", "HEAD"]).unwrap())
+            .unwrap()
+            .trim()
+            .to_owned();
         assert!(repo.strings(&["merge", "topic"]).is_err());
         let snapshot = repo.snapshot().unwrap();
         assert_eq!(snapshot.operation, "MERGING");
-        assert_eq!(snapshot.commits[0].subject, "current");
+        assert_eq!(snapshot.head.as_deref(), Some(current.as_str()));
         let file = &snapshot.files[0];
         assert!(file.conflicted());
         let conflict = repo
@@ -1250,7 +1245,14 @@ mod tests {
         repo.stage(std::slice::from_ref(file)).unwrap();
         assert!(!repo.snapshot().unwrap().files[0].conflicted());
         repo.commit("修复冲突\n\n中文提交内容").unwrap();
-        assert_eq!(repo.snapshot().unwrap().commits[0].subject, "修复冲突");
+        let updated = repo.snapshot().unwrap().head.unwrap();
+        assert_ne!(updated, current);
+        assert!(
+            repo.preview(&Selection::Commit(updated))
+                .unwrap()
+                .text
+                .contains("修复冲突")
+        );
     }
 
     #[test]

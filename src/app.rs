@@ -27,20 +27,13 @@ mod changes;
 pub enum Tab {
     Changes,
     Staged,
-    Log,
     Files,
     Stash,
     Branches,
 }
 
 impl Tab {
-    pub const ALL: [Self; 5] = [
-        Self::Changes,
-        Self::Log,
-        Self::Files,
-        Self::Stash,
-        Self::Branches,
-    ];
+    pub const ALL: [Self; 4] = [Self::Changes, Self::Branches, Self::Files, Self::Stash];
 }
 
 #[derive(Default)]
@@ -127,7 +120,7 @@ pub struct App {
     pub repository_state: ListState,
     pub change_panes: [ChangeState; 2],
     change_tab: Tab,
-    collapsed: [HashSet<PathBuf>; 6],
+    collapsed: [HashSet<PathBuf>; 5],
     history_generation: u64,
     sender: Sender<Request>,
     receiver: Receiver<Response>,
@@ -192,9 +185,7 @@ impl App {
     }
 
     pub fn commit_list(&self) -> bool {
-        self.file_history.is_some()
-            || (self.tab == Tab::Log && self.history.is_none())
-            || self.branch_graph_view()
+        self.file_history.is_some() || self.branch_graph_view()
     }
 
     pub fn commit_at(&self, index: usize) -> Option<&Commit> {
@@ -212,7 +203,7 @@ impl App {
                 .get(index)
                 .map(|entry| &entry.commit)
         } else {
-            self.snapshot.as_ref()?.commits.get(index)
+            None
         }
     }
 
@@ -225,9 +216,7 @@ impl App {
                 .as_ref()
                 .map_or(0, |graph| graph.entries.len())
         } else {
-            self.snapshot
-                .as_ref()
-                .map_or(0, |snapshot| snapshot.commits.len())
+            0
         }
     }
 
@@ -258,10 +247,9 @@ impl App {
         match self.tab {
             Tab::Changes => 0,
             Tab::Staged => 1,
-            Tab::Log => 2,
-            Tab::Files => 3,
-            Tab::Stash => 4,
-            Tab::Branches => 5,
+            Tab::Files => 2,
+            Tab::Stash => 3,
+            Tab::Branches => 4,
         }
     }
 
@@ -507,7 +495,7 @@ impl App {
             .filter(|(_, file)| file.label().to_lowercase().contains(&query))
             .map(|(index, _)| index)
             .collect();
-        crate::tree::rows(&files, &indices, &self.collapsed[3])
+        crate::tree::rows(&files, &indices, &self.collapsed[2])
     }
 
     pub fn file_history_has_origin(&self) -> bool {
@@ -567,9 +555,9 @@ impl App {
         };
         if row.directory && (toggle || (open && !row.expanded) || (!open && row.expanded)) {
             if row.expanded {
-                self.collapsed[3].insert(row.path.clone());
+                self.collapsed[2].insert(row.path.clone());
             } else {
-                self.collapsed[3].remove(&row.path);
+                self.collapsed[2].remove(&row.path);
             }
         } else if open {
             if row.directory && !row.files.is_empty() && self.repository_selected + 1 < rows.len() {
@@ -635,7 +623,7 @@ impl App {
                     })
                     .collect();
                 for parent in parents {
-                    self.collapsed[3].remove(&parent);
+                    self.collapsed[2].remove(&parent);
                 }
             }
             self.sync_repository_history();
@@ -683,7 +671,7 @@ impl App {
             self.repository_state = ListState::default();
         }
         for parent in path.ancestors().skip(1) {
-            self.collapsed[3].remove(parent);
+            self.collapsed[2].remove(parent);
         }
         if let Some(index) = self
             .repository_rows()
@@ -769,7 +757,7 @@ impl App {
             return_list_state: std::mem::take(&mut self.list_state),
         });
         self.selected = 0;
-        self.collapsed[4].clear();
+        self.collapsed[3].clear();
         self.list_focus = true;
         self.load_preview();
         self.notice("Loading stash files…", false);
@@ -985,11 +973,8 @@ impl App {
                                 .get(self.branches.selected)
                                 .copied()
                                 .filter(|row| !matches!(row, crate::branches::Row::Branch(_)));
-                            let head_changed = self
-                                .snapshot
-                                .as_ref()
-                                .and_then(|s| s.commits.first().map(|c| &c.id))
-                                != snapshot.commits.first().map(|c| &c.id);
+                            let head_changed = self.snapshot.as_ref().and_then(|s| s.head.as_ref())
+                                != snapshot.head.as_ref();
                             let previous = self.selection();
                             let change_anchors: Vec<_> = [Tab::Changes, Tab::Staged]
                                 .into_iter()
@@ -1534,13 +1519,12 @@ impl App {
                 self.list_focus = true;
             }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if self.fullscreen => {}
-            KeyCode::Char('1' | '2' | '3' | '4' | '5') => {
+            KeyCode::Char('1' | '2' | '3' | '4') => {
                 let tab = match key.code {
                     KeyCode::Char('1') => Tab::Changes,
-                    KeyCode::Char('2') => Tab::Log,
+                    KeyCode::Char('2') => Tab::Branches,
                     KeyCode::Char('3') => Tab::Files,
-                    KeyCode::Char('4') => Tab::Stash,
-                    _ => Tab::Branches,
+                    _ => Tab::Stash,
                 };
                 self.switch_tab(tab);
             }
@@ -1708,7 +1692,7 @@ impl App {
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('s') if self.branch_list() => self.switch_selected_branch(),
             KeyCode::Char('s' | 'u' | 'c' | 'e')
-                if matches!(self.tab, Tab::Log | Tab::Files | Tab::Stash | Tab::Branches) =>
+                if matches!(self.tab, Tab::Files | Tab::Stash | Tab::Branches) =>
             {
                 self.notice("History is read-only", false);
             }

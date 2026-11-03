@@ -110,6 +110,20 @@ impl Repo {
                 worktree: (!fields[5].is_empty()).then(|| PathBuf::from(os_string(fields[5]))),
             });
         }
+        if !branches.iter().any(|branch| branch.current)
+            && let Ok(bytes) = self.strings(&["rev-parse", "--verify", "-q", "HEAD"])
+        {
+            branches.push(Branch {
+                reference: "HEAD".into(),
+                name: "detached HEAD".into(),
+                tip: String::from_utf8_lossy(&bytes).trim().to_owned(),
+                current: true,
+                remote: false,
+                upstream: String::new(),
+                tracking: String::new(),
+                worktree: None,
+            });
+        }
         branches.sort_by_key(|branch| (!branch.current, branch.remote));
         Ok(branches)
     }
@@ -334,6 +348,46 @@ mod tests {
                 .contains("worktree")
         );
         assert_eq!(head(&repo), before);
+    }
+
+    #[test]
+    fn detached_head_keeps_its_own_history_available_without_named_branches() {
+        let (_dir, repo) = fixture();
+        repo.strings(&["switch", "--detach"]).unwrap();
+        fs::write(repo.root.join("file"), "detached work\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("detached commit").unwrap();
+        let tip = head(&repo);
+        let refs = repo.strings(&["show-ref"]).unwrap();
+        let branches = repo.branches().unwrap();
+        assert!(branches[0].current);
+        assert_eq!(branches[0].reference, "HEAD");
+        assert_eq!(branches[0].tip, tip);
+        let graph = repo.branch_graph(&[branches[0].tip.clone()], PAGE).unwrap();
+        assert_eq!(graph.entries[0].commit.subject, "detached commit");
+        assert_eq!(graph.entries.len(), 2);
+        repo.switch_branch("HEAD").unwrap();
+        assert_eq!(repo.strings(&["show-ref"]).unwrap(), refs);
+        assert_eq!(repo.snapshot().unwrap().head.as_deref(), Some(tip.as_str()));
+        repo.strings(&["update-ref", "-d", "refs/heads/main"])
+            .unwrap();
+        let branches = repo.branches().unwrap();
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].reference, "HEAD");
+        assert_eq!(
+            repo.branch_graph(&[branches[0].tip.clone()], PAGE)
+                .unwrap()
+                .entries
+                .len(),
+            2
+        );
+        repo.strings(&["switch", "-c", "restored"]).unwrap();
+        assert!(
+            repo.branches()
+                .unwrap()
+                .iter()
+                .all(|branch| branch.reference != "HEAD")
+        );
     }
 
     #[test]

@@ -138,7 +138,7 @@ mod tests {
             operation: String::new(),
             files: vec![file.clone()],
             committed_files: vec![file],
-            commits: vec![],
+            head: None,
             stashes: vec![],
             branches: vec![],
         });

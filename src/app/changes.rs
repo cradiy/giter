@@ -133,7 +133,7 @@ mod tests {
             })
             .collect(),
             committed_files: vec![],
-            commits: vec![],
+            head: None,
             stashes: vec![],
             branches: vec![],
         });
@@ -204,7 +204,7 @@ mod tests {
                 .any(|row| row.path == std::path::Path::new("src/both.rs"))
         );
         press(&mut app, KeyCode::Char('l'), KeyModifiers::CONTROL);
-        assert!(app.tab == Tab::Log);
+        assert!(app.tab == Tab::Branches);
         press(&mut app, KeyCode::Char('h'), KeyModifiers::CONTROL);
         assert!(app.tab == Tab::Staged);
         assert!(app.filter.is_empty());

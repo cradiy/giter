@@ -167,20 +167,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .map(|s| {
             [
                 s.files.len(),
-                s.commits.len(),
+                s.branches.len(),
                 s.committed_files.len(),
                 s.stashes.len(),
-                s.branches.len(),
             ]
         })
-        .unwrap_or([0; 5]);
+        .unwrap_or([0; 4]);
     let mut tabs = Vec::new();
     for (i, (tab, name)) in [
         (Tab::Changes, "Changes"),
-        (Tab::Log, "History"),
+        (Tab::Branches, "Branches"),
         (Tab::Files, "Files"),
         (Tab::Stash, "Stash"),
-        (Tab::Branches, "Branches"),
     ]
     .into_iter()
     .enumerate()
@@ -188,7 +186,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let accent = match tab {
             Tab::Changes => BLUE,
             Tab::Staged => GREEN,
-            Tab::Log => PURPLE,
             Tab::Files => CYAN,
             Tab::Stash => PEACH,
             Tab::Branches => TEAL,
@@ -198,7 +195,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 let short = match tab {
                     Tab::Changes => "Chg",
                     Tab::Staged => "Stg",
-                    Tab::Log => "Log",
                     Tab::Files => "Files",
                     Tab::Stash => "Stash",
                     Tab::Branches => "Br",
@@ -991,7 +987,7 @@ fn render_help(frame: &mut Frame) {
         Line::raw(" gg / G          First / last item or line"),
         Line::raw(" Ctrl+d / Ctrl+u Half page down / up"),
         Line::raw(" H / L           Scroll content horizontally"),
-        Line::raw(" 1..5            Changes / history / files / stash / branches"),
+        Line::raw(" 1..4            Changes / branches / files / stash"),
         Line::raw(" Branches        Enter: graph → files; s: switch selected branch"),
         Line::raw(" f               Show selected file history"),
         Line::raw(" /               Search current list (Unicode input)"),

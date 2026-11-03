@@ -204,7 +204,9 @@ fn graph(frame: &mut Frame, area: Rect, app: &mut App, active: bool) {
                     .iter()
                     .filter(|branch| branch.tip == entry.commit.id)
                 {
-                    let name = if branch.current {
+                    let name = if branch.reference == "HEAD" {
+                        "HEAD (detached)".into()
+                    } else if branch.current {
                         format!("HEAD → {}", branch.name)
                     } else {
                         branch.name.clone()
@@ -289,7 +291,9 @@ fn graph(frame: &mut Frame, area: Rect, app: &mut App, active: bool) {
         } else {
             format!(
                 " {count}{}",
-                if branch.is_some_and(|branch| branch.current) {
+                if branch.is_some_and(|branch| branch.reference == "HEAD") {
+                    " · detached HEAD"
+                } else if branch.is_some_and(|branch| branch.current) {
                     " · current branch"
                 } else {
                     " · same tip as HEAD"
@@ -359,7 +363,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
-    fn selected_graph_ref_badges_keep_their_colors_and_five_tabs_fit_minimum_width() {
+    fn selected_graph_ref_badges_keep_their_colors_and_four_tabs_fit_minimum_width() {
         let mut app = App::new(Repo {
             root: "/nonexistent-giter-ui-test".into(),
         });
@@ -375,7 +379,7 @@ mod tests {
             operation: String::new(),
             files: vec![],
             committed_files: vec![],
-            commits: vec![commit.clone()],
+            head: Some(commit.id.clone()),
             stashes: vec![],
             branches: vec![Branch {
                 reference: "refs/heads/feature/ime".into(),
@@ -424,6 +428,6 @@ mod tests {
         let tabs: String = (0..60)
             .map(|x| narrow.backend().buffer()[(x, 0)].symbol())
             .collect();
-        assert!(tabs.contains("1 Chg") && tabs.contains("5 Br"));
+        assert!(tabs.contains("1 Chg") && tabs.contains("2 Br"));
     }
 }
