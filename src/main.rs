@@ -6,6 +6,7 @@ mod graph;
 mod graphics;
 mod highlight;
 mod input;
+mod terminal;
 mod theme;
 mod tree;
 mod ui;
@@ -20,13 +21,13 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste},
-    execute,
+    event, execute,
     terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
 };
 
 use app::{Action, App};
 use git::Repo;
+use terminal::TerminalGuard;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -35,8 +36,6 @@ struct Args {
     #[arg(default_value = ".")]
     path: PathBuf,
 }
-
-struct TerminalGuard;
 
 struct SynchronizedFrame;
 
@@ -53,13 +52,6 @@ impl Drop for SynchronizedFrame {
     }
 }
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-        ratatui::restore();
-    }
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
     let repo = Repo::open(&args.path)?;
@@ -68,15 +60,8 @@ fn main() -> Result<()> {
         "giter requires an interactive terminal"
     );
     let watch = watch::RepoWatch::new(repo.clone()).context("Cannot watch repository")?;
-    let mut terminal = ratatui::init();
-    let _guard = TerminalGuard;
-    let panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-        ratatui::restore();
-        panic_hook(info);
-    }));
-    execute!(io::stdout(), EnableBracketedPaste)?;
+    let mut guard = TerminalGuard::new();
+    let mut terminal = guard.enter()?;
     let mut app = App::new(repo);
     let mut dirty = true;
     loop {
@@ -106,11 +91,11 @@ fn main() -> Result<()> {
                 Action::None => {}
                 Action::Editor(path) => match app.repo.editor(&path) {
                     Ok(mut command) => {
-                        execute!(io::stdout(), DisableBracketedPaste)?;
-                        ratatui::restore();
+                        app.graphics.hide(&mut io::stdout())?;
+                        terminal.show_cursor()?;
+                        guard.leave();
                         let result = command.status().context("Cannot launch editor");
-                        terminal = ratatui::init();
-                        execute!(io::stdout(), EnableBracketedPaste)?;
+                        terminal = guard.enter()?;
                         terminal.clear()?;
                         match result {
                             Ok(status) if status.success() => {
