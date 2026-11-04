@@ -14,6 +14,12 @@ pub struct Row {
     pub files: Vec<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub enum Order {
+    DirectoriesFirst,
+    Name,
+}
+
 #[derive(Default)]
 struct Directory {
     children: BTreeMap<OsString, Directory>,
@@ -21,7 +27,12 @@ struct Directory {
     files: Vec<usize>,
 }
 
-pub fn rows(files: &[File], indices: &[usize], collapsed: &HashSet<PathBuf>) -> Vec<Row> {
+pub fn rows(
+    files: &[File],
+    indices: &[usize],
+    collapsed: &HashSet<PathBuf>,
+    order: Order,
+) -> Vec<Row> {
     let mut root = Directory::default();
     for &index in indices {
         let mut directory = &mut root;
@@ -44,7 +55,7 @@ pub fn rows(files: &[File], indices: &[usize], collapsed: &HashSet<PathBuf>) -> 
         String::new(),
         String::new(),
         files,
-        collapsed,
+        (collapsed, order),
         &mut rows,
     );
     rows
@@ -56,9 +67,10 @@ fn append(
     prefix: String,
     child_prefix: String,
     files: &[File],
-    collapsed: &HashSet<PathBuf>,
+    options: (&HashSet<PathBuf>, Order),
     rows: &mut Vec<Row>,
 ) {
+    let (collapsed, order) = options;
     let expanded = !collapsed.contains(&path);
     rows.push(Row {
         path: path.clone(),
@@ -80,15 +92,16 @@ fn append(
         .map(|(name, child)| Child::Directory(name, child))
         .chain(directory.direct.iter().map(|&index| Child::File(index)))
         .collect::<Vec<_>>();
-    children.sort_by_key(|child| match child {
+    children.sort_by_cached_key(|child| match child {
         Child::Directory(name, child) => (
-            !child.files.iter().any(|i| files[*i].conflicted()),
+            matches!(order, Order::DirectoriesFirst)
+                && !child.files.iter().any(|i| files[*i].conflicted()),
             false,
             name.to_os_string(),
         ),
         Child::File(index) => (
-            !files[*index].conflicted(),
-            true,
+            matches!(order, Order::DirectoriesFirst) && !files[*index].conflicted(),
+            matches!(order, Order::DirectoriesFirst),
             files[*index]
                 .path
                 .file_name()
@@ -107,7 +120,7 @@ fn append(
                 prefix,
                 format!("{child_prefix}{}", if last { "   " } else { "│  " }),
                 files,
-                collapsed,
+                options,
                 rows,
             ),
             Child::File(index) => rows.push(Row {
@@ -137,7 +150,7 @@ mod tests {
             })
             .collect();
         let collapsed = HashSet::from([PathBuf::from("src")]);
-        let rows = rows(&files, &[0, 1, 2, 3], &collapsed);
+        let rows = rows(&files, &[0, 1, 2, 3], &collapsed, Order::DirectoriesFirst);
         assert_eq!(rows[0].files, [0, 1, 2, 3]);
         let src = rows
             .iter()

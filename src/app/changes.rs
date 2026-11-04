@@ -46,6 +46,7 @@ impl App {
             files,
             &indices,
             &self.collapsed[usize::from(tab == Tab::Staged)],
+            crate::tree::Order::Name,
         )
     }
 
@@ -132,7 +133,7 @@ mod tests {
                 worktree,
             })
             .collect(),
-            committed_files: vec![],
+            committed_files: Arc::default(),
             head: None,
             stashes: vec![],
             branches: vec![],
@@ -221,6 +222,37 @@ mod tests {
         assert!(app.tab == Tab::Changes && app.fullscreen);
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!app.fullscreen && app.filter == "working.rs");
+    }
+
+    #[test]
+    fn changes_and_staged_sort_sibling_names_without_directory_priority() {
+        let mut app = app();
+        app.snapshot.as_mut().unwrap().files = ["b-folder/z.rs", "a.rs", "d-folder/y.rs", "c.rs"]
+            .into_iter()
+            .map(|path| File {
+                path: path.into(),
+                original: None,
+                index: 'M',
+                worktree: 'M',
+            })
+            .collect();
+        for tab in [Tab::Changes, Tab::Staged] {
+            let rows = app.change_rows(tab);
+            let paths: Vec<_> = rows.iter().map(|row| row.path.to_str().unwrap()).collect();
+            assert_eq!(
+                paths,
+                [
+                    "",
+                    "a.rs",
+                    "b-folder",
+                    "b-folder/z.rs",
+                    "c.rs",
+                    "d-folder",
+                    "d-folder/y.rs"
+                ]
+            );
+            assert_eq!(rows[2].files, [0]);
+        }
     }
 
     #[test]

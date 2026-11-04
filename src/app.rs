@@ -1,5 +1,5 @@
 use std::{
-    borrow::Cow,
+    cell::RefCell,
     collections::HashSet,
     path::PathBuf,
     sync::{
@@ -22,6 +22,7 @@ use crate::{
 
 mod branches;
 mod changes;
+mod repository;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -118,6 +119,7 @@ pub struct App {
     pub repository_selected: usize,
     pub repository_filter: String,
     pub repository_state: ListState,
+    repository_cache: RefCell<Option<Arc<repository::Tree>>>,
     pub change_panes: [ChangeState; 2],
     change_tab: Tab,
     collapsed: [HashSet<PathBuf>; 5],
@@ -164,6 +166,7 @@ impl App {
             repository_selected: 0,
             repository_filter: String::new(),
             repository_state: ListState::default(),
+            repository_cache: RefCell::default(),
             change_panes: std::array::from_fn(|_| ChangeState::default()),
             change_tab: Tab::Changes,
             collapsed: std::array::from_fn(|_| HashSet::new()),
@@ -235,7 +238,7 @@ impl App {
         } else {
             self.snapshot.as_ref().map_or(&[], |snapshot| {
                 if self.tab == Tab::Files {
-                    snapshot.committed_files.as_slice()
+                    snapshot.committed_files.as_ref()
                 } else {
                     snapshot.files.as_slice()
                 }
@@ -421,6 +424,7 @@ impl App {
             self.files(),
             &self.items(),
             &self.collapsed[self.tree_index()],
+            crate::tree::Order::DirectoriesFirst,
         )
     }
 
@@ -464,40 +468,6 @@ impl App {
         self.load_preview();
     }
 
-    pub fn repository_files(&self) -> Cow<'_, [File]> {
-        let files = self
-            .snapshot
-            .as_ref()
-            .map_or(&[][..], |snapshot| snapshot.committed_files.as_slice());
-        if let Some(history) = &self.file_history
-            && history.start.is_some()
-            && !files.iter().any(|file| file.path == history.path)
-        {
-            let mut files = files.to_vec();
-            files.push(File {
-                path: history.path.clone(),
-                original: None,
-                index: ' ',
-                worktree: ' ',
-            });
-            Cow::Owned(files)
-        } else {
-            Cow::Borrowed(files)
-        }
-    }
-
-    pub fn repository_rows(&self) -> Vec<crate::tree::Row> {
-        let files = self.repository_files();
-        let query = self.repository_filter.to_lowercase();
-        let indices: Vec<_> = files
-            .iter()
-            .enumerate()
-            .filter(|(_, file)| file.label().to_lowercase().contains(&query))
-            .map(|(index, _)| index)
-            .collect();
-        crate::tree::rows(&files, &indices, &self.collapsed[2])
-    }
-
     pub fn file_history_has_origin(&self) -> bool {
         self.file_history
             .as_ref()
@@ -522,19 +492,29 @@ impl App {
     }
 
     fn sync_repository_history(&mut self) {
-        if let Some(Selection::RepositoryFile(file)) = self.repository_selection() {
+        let rows = self.repository_rows();
+        let file = rows
+            .get(self.repository_selected)
+            .filter(|row| !row.directory)
+            .and_then(|row| {
+                self.repository_files()
+                    .get(row.files[0])
+                    .cloned()
+                    .map(|file| (row.files[0], file))
+            });
+        if let Some((index, file)) = file {
             if self
                 .file_history
                 .as_ref()
                 .is_none_or(|history| history.path != file.path)
             {
                 let query = file.original.clone().unwrap_or_else(|| file.path.clone());
-                if self.snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot
-                        .committed_files
-                        .iter()
-                        .any(|committed| committed.path == query)
-                }) {
+                if self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.committed_files.get(index))
+                    .is_some_and(|committed| committed.path == query)
+                {
                     self.open_file_history(query.clone(), query, None);
                 } else {
                     self.switch_tab(Tab::Files);
@@ -673,13 +653,7 @@ impl App {
         for parent in path.ancestors().skip(1) {
             self.collapsed[2].remove(parent);
         }
-        if let Some(index) = self
-            .repository_rows()
-            .iter()
-            .position(|row| !row.directory && row.path == path)
-        {
-            self.repository_selected = index;
-        }
+        self.select_repository_path(&path);
         self.history_generation += 1;
         let mut view = self.file_history.take().unwrap_or_else(|| FileHistory {
             path: path.clone(),
@@ -701,15 +675,8 @@ impl App {
         view.refreshing = false;
         view.token = self.history_generation;
         self.file_history = Some(view);
-        if let Some(index) = self.repository_rows().iter().position(|row| {
-            !row.directory
-                && self
-                    .file_history
-                    .as_ref()
-                    .is_some_and(|view| row.path == view.path)
-        }) {
-            self.repository_selected = index;
-        }
+        let path = self.file_history.as_ref().unwrap().path.clone();
+        self.select_repository_path(&path);
         self.tab = Tab::Files;
         self.file_tree_focus = false;
         self.selected = 0;
@@ -1087,7 +1054,7 @@ impl App {
                                         {
                                             self.repository_rows()
                                         } else {
-                                            self.tree_rows()
+                                            self.tree_rows().into()
                                         };
                                         if let Some(position) = rows
                                             .iter()

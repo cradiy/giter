@@ -14,12 +14,7 @@ use crate::{
 };
 
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
-    let width = if app.branch_list() {
-        (area.width / 3).clamp(22, 38)
-    } else {
-        area.width * 55 / 100
-    };
-    let columns = Layout::horizontal([Constraint::Length(width), Constraint::Min(20)]).split(area);
+    let columns = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(area);
     app.page_height = if app.list_focus {
         columns[0].height
     } else {
@@ -378,7 +373,7 @@ mod tests {
             branch: "feature/ime".into(),
             operation: String::new(),
             files: vec![],
-            committed_files: vec![],
+            committed_files: std::sync::Arc::default(),
             head: Some(commit.id.clone()),
             stashes: vec![],
             branches: vec![Branch {
@@ -416,7 +411,7 @@ mod tests {
             .draw(|frame| super::super::draw(frame, &mut app))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let head = (38..115)
+        let head = (60..115)
             .find(|x| buffer[(*x, 3)].symbol() == "H" && buffer[(*x + 1, 3)].symbol() == "E")
             .unwrap();
         assert_eq!(buffer[(head, 3)].fg, BG);

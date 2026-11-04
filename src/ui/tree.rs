@@ -137,7 +137,7 @@ mod tests {
             branch: "main".into(),
             operation: String::new(),
             files: vec![file.clone()],
-            committed_files: vec![file],
+            committed_files: vec![file].into(),
             head: None,
             stashes: vec![],
             branches: vec![],
@@ -150,7 +150,7 @@ mod tests {
                 .draw(|frame| super::super::draw(frame, &mut app))
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            let sidebar = (width / 3).clamp(23, 42);
+            let sidebar = width / 2;
             let names: Vec<_> = (1..height - 2)
                 .filter(|y| {
                     let row: String = (0..sidebar).map(|x| buffer[(x, *y)].symbol()).collect();
@@ -163,7 +163,9 @@ mod tests {
                     .find(|x| buffer[(*x, y)].symbol() == symbol)
                     .unwrap();
                 assert_eq!(buffer[(x, y)].fg, color);
-                assert!((0..sidebar).any(|x| buffer[(x, y)].symbol() == "…"));
+                if width == 60 {
+                    assert!((0..sidebar).any(|x| buffer[(x, y)].symbol() == "…"));
+                }
             }
             assert!(
                 matches!(app.selection(), Some(crate::git::Selection::File(file, false)) if file.path == path)
@@ -178,7 +180,7 @@ mod tests {
             .unwrap();
         let buffer = terminal.backend().buffer();
         let rows: Vec<String> = (1..22)
-            .map(|y| (0..26).map(|x| buffer[(x, y)].symbol()).collect())
+            .map(|y| (0..30).map(|x| buffer[(x, y)].symbol()).collect())
             .collect();
         assert!(rows.iter().any(|row| row.contains("app.rs")));
         assert_eq!(app.repository_rows().last().unwrap().path, path);

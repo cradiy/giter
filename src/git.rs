@@ -101,10 +101,17 @@ pub struct Snapshot {
     pub branch: String,
     pub operation: String,
     pub files: Vec<File>,
-    pub committed_files: Vec<File>,
+    pub committed_files: Arc<[File]>,
     pub head: Option<String>,
     pub stashes: Vec<Stash>,
     pub branches: Vec<crate::branches::Branch>,
+}
+
+#[derive(Default)]
+struct SnapshotCache {
+    initialized: bool,
+    head: Option<String>,
+    files: Arc<[File]>,
 }
 
 pub struct CommitDetails {
@@ -251,7 +258,12 @@ impl Repo {
             .collect())
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self) -> Result<Snapshot> {
+        self.snapshot_cached(&mut SnapshotCache::default())
+    }
+
+    fn snapshot_cached(&self, cache: &mut SnapshotCache) -> Result<Snapshot> {
         let status = self.strings(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])?;
         let mut files = parse_status(&status)?;
         files.sort_by_key(|f| (!f.conflicted(), f.path.clone()));
@@ -259,9 +271,10 @@ impl Repo {
             .strings(&["rev-parse", "--verify", "-q", "HEAD"])
             .ok()
             .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned());
-        let has_head = head.is_some();
-        let committed_files = if has_head {
-            self.strings(&["ls-tree", "-r", "--name-only", "-z", "HEAD"])?
+        let committed_files = if cache.initialized && cache.head == head {
+            cache.files.clone()
+        } else if let Some(head) = &head {
+            self.strings(&["ls-tree", "-r", "--name-only", "-z", head])?
                 .split(|byte| *byte == 0)
                 .filter(|path| !path.is_empty())
                 .map(|path| File {
@@ -270,9 +283,10 @@ impl Repo {
                     index: ' ',
                     worktree: ' ',
                 })
-                .collect()
+                .collect::<Vec<_>>()
+                .into()
         } else {
-            Vec::new()
+            Arc::default()
         };
         let branch = self
             .strings(&["symbolic-ref", "--short", "HEAD"])
@@ -298,7 +312,7 @@ impl Repo {
                 break;
             }
         }
-        Ok(Snapshot {
+        let snapshot = Snapshot {
             branch,
             operation,
             files,
@@ -306,7 +320,11 @@ impl Repo {
             head,
             stashes: self.stashes()?,
             branches: self.branches()?,
-        })
+        };
+        cache.head = snapshot.head.clone();
+        cache.files = snapshot.committed_files.clone();
+        cache.initialized = true;
+        Ok(snapshot)
     }
 
     fn stashes(&self) -> Result<Vec<Stash>> {
@@ -1098,25 +1116,42 @@ pub enum Response {
     Failed(String),
 }
 
+fn latest_request(
+    mut request: Request,
+    receive: &Receiver<Request>,
+    pending: &mut Option<Request>,
+) -> Request {
+    if matches!(
+        request,
+        Request::Preview(..) | Request::BranchGraph(..) | Request::FileHistory(..)
+    ) {
+        while let Ok(next) = receive.try_recv() {
+            if std::mem::discriminant(&next) == std::mem::discriminant(&request) {
+                request = next;
+            } else {
+                *pending = Some(next);
+                break;
+            }
+        }
+    }
+    request
+}
+
 pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
     let (send, receive) = mpsc::channel();
     let (results, updates) = mpsc::channel();
     thread::spawn(move || {
         let mut pending = None;
-        while let Some(mut request) = pending.take().or_else(|| receive.recv().ok()) {
-            if matches!(request, Request::Preview(..) | Request::BranchGraph(..)) {
-                while let Ok(next) = receive.try_recv() {
-                    if std::mem::discriminant(&next) == std::mem::discriminant(&request) {
-                        request = next;
-                    } else {
-                        pending = Some(next);
-                        break;
-                    }
-                }
+        let mut cache = SnapshotCache::default();
+        while let Some(request) = pending.take().or_else(|| receive.recv().ok()) {
+            let request = latest_request(request, &receive, &mut pending);
+            if matches!(request, Request::Refresh) {
+                cache.initialized = false;
             }
             let response = match request {
                 Request::Refresh | Request::AutoRefresh => Response::Snapshot(
-                    repo.snapshot().map_err(|e| format!("{e:#}")),
+                    repo.snapshot_cached(&mut cache)
+                        .map_err(|e| format!("{e:#}")),
                     None,
                     matches!(request, Request::AutoRefresh),
                 ),
@@ -1158,7 +1193,8 @@ pub fn worker(repo: Repo) -> (Sender<Request>, Receiver<Response>) {
                     };
                     match result {
                         Ok(()) => Response::Snapshot(
-                            repo.snapshot().map_err(|e| format!("{e:#}")),
+                            repo.snapshot_cached(&mut cache)
+                                .map_err(|e| format!("{e:#}")),
                             Some(message.into()),
                             false,
                         ),
@@ -1194,6 +1230,73 @@ mod tests {
             .unwrap();
         repo.strings(&["config", "user.name", "Test"]).unwrap();
         (dir, repo)
+    }
+
+    #[test]
+    fn committed_file_cache_survives_worktree_changes_and_invalidates_after_commit() {
+        let (_dir, repo) = fixture();
+        let mut cache = SnapshotCache::default();
+        assert!(
+            repo.snapshot_cached(&mut cache)
+                .unwrap()
+                .committed_files
+                .is_empty()
+        );
+        fs::write(repo.root.join("a.rs"), "base\n").unwrap();
+        repo.strings(&["add", "."]).unwrap();
+        repo.commit("initial").unwrap();
+        let first = repo.snapshot_cached(&mut cache).unwrap();
+        fs::write(repo.root.join("a.rs"), "working change\n").unwrap();
+        fs::write(repo.root.join("b.rs"), "staged addition\n").unwrap();
+        repo.strings(&["add", "b.rs"]).unwrap();
+        let working = repo.snapshot_cached(&mut cache).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.committed_files,
+            &working.committed_files
+        ));
+        assert_eq!(working.committed_files.len(), 1);
+        assert_eq!(working.files.len(), 2);
+        repo.commit("add b").unwrap();
+        let committed = repo.snapshot_cached(&mut cache).unwrap();
+        assert!(!Arc::ptr_eq(
+            &first.committed_files,
+            &committed.committed_files
+        ));
+        assert_eq!(committed.committed_files.len(), 2);
+        assert!(
+            committed
+                .committed_files
+                .iter()
+                .any(|file| file.path == Path::new("b.rs"))
+        );
+    }
+
+    #[test]
+    fn queued_file_history_queries_keep_the_latest_without_crossing_write_requests() {
+        let (send, receive) = mpsc::channel();
+        for token in [2, 3] {
+            send.send(Request::FileHistory(token, "file.rs".into(), None))
+                .unwrap();
+        }
+        send.send(Request::Stage(vec![])).unwrap();
+        send.send(Request::FileHistory(4, "other.rs".into(), None))
+            .unwrap();
+        let mut pending = None;
+        let request = latest_request(
+            Request::FileHistory(1, "file.rs".into(), None),
+            &receive,
+            &mut pending,
+        );
+        assert!(matches!(request, Request::FileHistory(3, ..)));
+        assert!(matches!(
+            latest_request(pending.take().unwrap(), &receive, &mut pending),
+            Request::Stage(_)
+        ));
+        assert!(matches!(
+            receive.try_recv().unwrap(),
+            Request::FileHistory(4, ..)
+        ));
+        assert!(pending.is_none());
     }
 
     #[test]

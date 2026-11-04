@@ -231,9 +231,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.tab == Tab::Files {
         draw_files(frame, rows[1], app);
     } else {
-        let sidebar = (area.width / 3).clamp(23, 42);
-        let columns =
-            Layout::horizontal([Constraint::Length(sidebar), Constraint::Min(20)]).split(rows[1]);
+        let columns = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(rows[1]);
         app.page_height = if app.list_focus {
             columns[0].height.saturating_sub(2) as usize
         } else {
@@ -433,7 +431,7 @@ fn change_symbol(status: &str) -> char {
 fn file_items(
     app: &App,
     files: &[crate::git::File],
-    rows: Vec<crate::tree::Row>,
+    rows: &[crate::tree::Row],
     staged: Option<bool>,
     width: u16,
 ) -> Vec<ListItem<'static>> {
@@ -517,7 +515,7 @@ fn render_changes(frame: &mut Frame, area: Rect, app: &mut App, tab: Tab) {
     let items = file_items(
         app,
         files,
-        rows,
+        &rows,
         Some(tab == Tab::Staged),
         area.width.saturating_sub(4),
     );
@@ -582,12 +580,31 @@ fn render_repository_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let count = rows.first().map_or(0, |row| row.files.len());
     app.repository_selected = app.repository_selected.min(rows.len().saturating_sub(1));
     let files = app.repository_files();
-    let items = file_items(app, &files, rows, None, area.width.saturating_sub(4));
-    app.repository_state.select(if items.is_empty() {
-        None
-    } else {
-        Some(app.repository_selected)
-    });
+    let height = usize::from(area.height.saturating_sub(2));
+    let offset = app
+        .repository_state
+        .offset()
+        .min(app.repository_selected)
+        .max(
+            app.repository_selected
+                .saturating_add(1)
+                .saturating_sub(height),
+        )
+        .min(rows.len().saturating_sub(height));
+    let end = offset.saturating_add(height).min(rows.len());
+    let items = file_items(
+        app,
+        &files,
+        &rows[offset..end],
+        None,
+        area.width.saturating_sub(4),
+    );
+    app.repository_state
+        .select((!rows.is_empty()).then_some(app.repository_selected));
+    *app.repository_state.offset_mut() = offset;
+    let mut visible_state = ratatui::widgets::ListState::default().with_selected(
+        (!rows.is_empty()).then_some(app.repository_selected.saturating_sub(offset)),
+    );
     let title = if app.repository_filter.is_empty() {
         format!(" Files · {count} ")
     } else {
@@ -603,16 +620,12 @@ fn render_repository_list(frame: &mut Frame, area: Rect, app: &mut App) {
             )
             .highlight_symbol("› "),
         area,
-        &mut app.repository_state,
+        &mut visible_state,
     );
 }
 
 fn draw_files(frame: &mut Frame, area: Rect, app: &mut App) {
-    let columns = Layout::horizontal([
-        Constraint::Length((area.width / 3).clamp(26, 48)),
-        Constraint::Min(26),
-    ])
-    .split(area);
+    let columns = Layout::horizontal([Constraint::Ratio(1, 2); 2]).split(area);
     app.page_height = area.height.saturating_sub(2) as usize;
     if app.file_tree_focus {
         render_repository_list(frame, columns[0], app);
@@ -703,7 +716,7 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut App) {
             items = file_items(
                 app,
                 files,
-                app.tree_rows(),
+                &app.tree_rows(),
                 Some(true),
                 area.width.saturating_sub(4),
             );
